@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="description" content="{{ section.description }}" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="generator" content="Zola" />
+    <link rel="icon" type="image/svg+xml" href="{{ get_url(path='favicon.svg') }}" />
+    <meta property="og:title" content="{{ section.title }}" />
+    <meta property="og:description" content="{{ section.description }}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="{{ get_url(path='favicon.svg') }}" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans:ital,wght@0,100..900;1,100..900&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.15.1/dist/katex.css"
+      integrity="sha384-WsHMgfkABRyG494OmuiNmkAOk8nhO1qE+Y6wns6v+EoNoTNxrWxYpl5ZYWFOLPCM"
+      crossorigin="anonymous"
+    />
+    <link rel="stylesheet" href="{{ get_url(path='style.css') }}" />
+    <title>{{ section.title }}</title>
+  </head>
+  <body>
+    <header class="site-header col">
+      <h1>{{ section.title }}</h1>
+      <div class="header-stack">
+        <div class="authors">
+          {% for author in section.extra.authors %}
+          <div class="author">
+            <span class="author-name">{% if author.url %}<a href="{{ author.url }}">{{ author.name }}</a>{% else %}{{ author.name }}{% endif %}</span>
+            {% if author.institution %}<p>{{ author.institution }}</p>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        <p class="conference">{{ section.extra.conference }}</p>
+        <div class="links">
+          {% for link in section.extra.links %}
+          {% if link.url %}<a class="pill" href="{{ link.url }}">{{ link.name }}</a>{% else %}<span class="pill pill-disabled">{{ link.name }}</span>{% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    </header>
+    <main class="col content">{{ section.content | safe }}</main>
+    <footer class="col site-footer">
+      <p>
+        This page was built using
+        <a href="https://github.com/RomanHauksson/academic-project-astro-template">Roman Hauksson's academic project page template</a>,
+        which was adapted from
+        <a href="https://github.com/eliahuhorwitz/Academic-project-page-template">Eliahu Horwitz's template</a>,
+        which was adapted from
+        <a href="https://nerfies.github.io/">Keunhong Park's project page for <i>Nerfies</i></a>.
+        It is licensed under a
+        <a href="http://creativecommons.org/licenses/by-sa/4.0/">Creative Commons Attribution-ShareAlike 4.0 International License</a>.
+      </p>
+    </footer>
+  </body>
+</html>

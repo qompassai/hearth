@@ -1,0 +1,13 @@
+# Zola prototype of the Kintsugi publication page (Astro replacement candidate).
+# Build: zola build   Serve: zola serve   Link check: zola check
+base_url = "https://qompass.ai/kintsugi/"
+title = "Kintsugi: Joint Attention for Byte-Size Models"
+description = "Shared goals in multi-agent systems through verified uptake and visible repair — a deterministic commitment protocol, byte-size models as the perceptual layer, and repairs that stay visible in the record."
+
+compile_sass = false
+build_search_index = false
+generate_sitemap = false
+
+[markdown]
+
+[extra]

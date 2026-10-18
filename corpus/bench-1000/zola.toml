@@ -1,0 +1,5 @@
+base_url = "https://example.org/"
+title = "Bench Corpus"
+compile_sass = false
+build_search_index = false
+generate_sitemap = false

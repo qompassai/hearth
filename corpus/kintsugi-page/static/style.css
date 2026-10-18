@@ -1,0 +1,281 @@
+/* Kintsugi publication page — plain CSS port of the Astro template's
+   Tailwind utilities (Layout.astro body, global.css @apply rules, and the
+   Header / HighlightedSection / Links / CodeBlock / Table components).
+   Zinc palette values are Tailwind's: 50 #fafafa, 200 #e4e4e7,
+   800 #27272a, 900 #18181b, 950 #09090b; blue 500 #3b82f6, 300 #93c5fd. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Noto Sans", sans-serif;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+  padding: 3rem 0 1.5rem;
+  color: #18181b;
+  background: #fafafa;
+}
+
+.col {
+  width: 100%;
+  max-width: 60rem;
+  min-width: 0;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
+}
+
+a {
+  color: #3b82f6;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+p {
+  font-size: 1.125rem;
+  line-height: 1.75rem;
+  width: 100%;
+}
+
+h1 {
+  font-size: 3rem;
+  line-height: 1;
+  text-align: center;
+  font-weight: 500;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1.875rem;
+  line-height: 2.25rem;
+  font-weight: 700;
+  width: 100%;
+  margin: 1.5rem 0 1rem;
+}
+
+h3 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  width: 100%;
+}
+
+ul,
+ol {
+  font-size: 1.125rem;
+  line-height: 1.75rem;
+  width: 100%;
+  padding-left: 1.5rem;
+}
+
+/* Header.astro + Authors.astro + Links.astro */
+.site-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2.5rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.header-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  align-items: center;
+}
+
+.authors {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  column-gap: 2rem;
+  row-gap: 1rem;
+  justify-content: center;
+}
+
+.author {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.author-name {
+  font-size: 1.25rem;
+}
+
+.author p {
+  margin: 0;
+}
+
+.conference {
+  text-align: center;
+  margin: 0;
+}
+
+.links {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.pill {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  background: #27272a;
+  color: #ffffff;
+  border-radius: 9999px;
+  font-size: 1.125rem;
+  padding: 0.5rem 1.25rem;
+  text-decoration: none;
+}
+
+a.pill:hover {
+  background: #09090b;
+  text-decoration: none;
+}
+
+.pill-disabled {
+  opacity: 0.55;
+}
+
+/* HighlightedSection.astro — full-bleed band inside the centered column */
+.highlight {
+  width: 100vw;
+  margin-left: calc(50% - 50vw);
+  background: #e4e4e7;
+  padding: 1.5rem 0;
+  display: flex;
+  justify-content: center;
+}
+
+.highlight-inner {
+  width: 100%;
+  max-width: 60rem;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+}
+
+.highlight-inner h2 {
+  margin-top: 0;
+}
+
+.highlight-inner p {
+  margin: 0;
+}
+
+/* Table.astro + global.css table rules */
+table {
+  width: 100%;
+  border-top: 2px solid #18181b;
+  border-bottom: 2px solid #18181b;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 1.125rem;
+}
+
+thead {
+  border-bottom: 1px solid #18181b;
+}
+
+th,
+td {
+  padding: 0.25rem 1rem;
+}
+
+/* CodeBlock.astro */
+pre {
+  background: #e4e4e7;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow: auto;
+  width: 100%;
+  max-width: 100%;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.smallcaps {
+  font-variant: small-caps;
+}
+
+.site-footer {
+  margin: auto;
+}
+
+.site-footer p {
+  color: #71717a;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+@media (max-width: 640px) {
+  table {
+    font-size: 0.95rem;
+  }
+
+  th,
+  td {
+    padding: 0.25rem 0.4rem;
+  }
+
+  pre {
+    font-size: 0.8rem;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    color: #fafafa;
+    background: #18181b;
+  }
+
+  a {
+    color: #93c5fd;
+  }
+
+  .pill {
+    background: #e4e4e7;
+    color: #18181b;
+  }
+
+  a.pill:hover {
+    background: #fafafa;
+    text-decoration: none;
+  }
+
+  .highlight {
+    background: #27272a;
+  }
+
+  pre {
+    background: #27272a;
+  }
+
+  table {
+    border-top-color: #fafafa;
+    border-bottom-color: #fafafa;
+  }
+
+  thead {
+    border-bottom-color: #fafafa;
+  }
+
+  .site-footer p {
+    color: #a1a1aa;
+  }
+}
