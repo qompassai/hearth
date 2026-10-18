@@ -1,6 +1,6 @@
 # Hearth — a Tiger Style Mojo static site generator
 
-**Status:** Draft v0.1 for ratification. Commissioned by Matt, 2026-10-16.
+**Status:** Ratified v0.1 (Matt, 2026-10-17). Commissioned by Matt, 2026-10-16.
 **Name:** Hearth (ruled by Matt, 2026-10-16) — the fixed fire at the center of the home; a site generator builds homes. Verified 2026-10-16: free on crates.io and as `github.com/qompassai/hearth` (all other candidates checked were taken on crates.io).
 **One-line summary:** A single native Mojo binary that turns Markdown + templates into a static site, built under the estate's Tiger Style Mojo guide as that guide's reference implementation — deterministic output, bounded everything, zero runtime dependencies, no Node, no npm, ever.
 
