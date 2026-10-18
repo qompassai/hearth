@@ -5,7 +5,7 @@ returned, not hidden.
 """
 
 from hearth.assets import OutputFile, _collect_tree, collect_static
-from hearth.check import check_output
+from hearth.check import check_files
 from hearth.config import parse_toml
 from hearth.frontmatter import split_frontmatter
 from hearth.markdown import render_markdown
@@ -82,7 +82,7 @@ def _assets_for(item: ContentItem, asset_files: List[String]) -> List[Value]:
 
 
 def _base_context(
-    fm: Value,
+    var fm: Value,
     item: ContentItem,
     md_html: String,
     headings_value: Value,
@@ -92,7 +92,7 @@ def _base_context(
 ) -> Value:
     """Start from the front matter (so custom fields carry through), then
     set the computed fields."""
-    var ctx = fm.copy()
+    var ctx = fm^
     if ctx.kind() != V_DICT:
         ctx = Value.dict(List[String](), List[Value]())
     var content = Value.string(md_html)
@@ -114,7 +114,7 @@ def _base_context(
     if ctx.get("extra").kind() != V_DICT:
         ctx.set("extra", Value.dict(List[String](), List[Value]()))
     if ctx.get("assets").kind() != V_LIST:
-        ctx.set("assets", Value.list(item_assets.copy()))
+        ctx.set("assets", Value.list(item_assets))
     return ctx^
 
 
@@ -129,16 +129,15 @@ def build_site(
 
     # First pass: build every item's context value.
     var contexts = List[Value]()
-    var bodies = List[String]()
     for ref item in scan.items:
         var raw_text = read_text_file(item.source_path)
         var split = split_frontmatter(raw_text)
         var fm = split[1].copy()
         var body = split[2].copy()
-        var expanded = expand_shortcodes(body, env, base_url)
+        var expanded = expand_shortcodes(body^, env, base_url)
         var md = render_markdown(expanded, site_extensions=True)
         var ctx = _base_context(
-            fm,
+            fm^,
             item,
             md.html,
             toc_value(md.headings),
@@ -147,7 +146,6 @@ def build_site(
             _assets_for(item, scan.asset_files),
         )
         contexts.append(ctx^)
-        bodies.append(expanded^)
 
     # Second pass: sections learn their child pages (direct children,
     # sorted by path — Zola's default section ordering here is path
@@ -199,9 +197,12 @@ def build_site(
             OutputFile(rel, read_text_file(join_path(content_dir, rel)))
         )
     var result = BuildResult()
-    for i in range(len(scan.items)):
+    # Descending order so each context can be MOVED out of the list
+    # with pop() instead of copied; output order does not matter --
+    # materialize writes the same tree either way.
+    for i in range(len(scan.items) - 1, -1, -1):
         var item = scan.items[i].copy()
-        var ctx = contexts[i].copy()
+        var ctx = contexts.pop()
         var template_name = ctx.get("template").to_display()
         if template_name == "":
             if item.is_section:
@@ -215,9 +216,9 @@ def build_site(
         var render_ctx = Value.dict(List[String](), List[Value]())
         render_ctx.set("config", cfg.copy())
         if item.is_section:
-            render_ctx.set("section", ctx.copy())
+            render_ctx.set("section", ctx^)
         else:
-            render_ctx.set("page", ctx.copy())
+            render_ctx.set("page", ctx^)
         var html = render_template(template_name, render_ctx, env, base_url)
         var out_rel = (
             "index.html"
@@ -270,5 +271,5 @@ def build_site(
     )
     result.files_written = len(outputs)
     materialize(outputs, result.output_dir)
-    result.problems = check_output(result.output_dir)
+    result.problems = check_files(outputs)
     return result^

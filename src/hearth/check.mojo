@@ -63,17 +63,17 @@ def _resolve_path(base_file_rel: String, url_path: String) -> String:
     return "/".join(parts)
 
 
-def check_output(output_dir: String) raises -> List[String]:
-    var files = List[OutputFile]()
-    _collect_tree(output_dir, String(), files, 0)
-    var present = List[String]()
-    var html_files = List[OutputFile]()
+def check_files(files: List[OutputFile]) -> List[String]:
+    """The check stage over an in-memory output set (the build path
+    already holds every byte it wrote; re-reading the tree from disk
+    would double the file work of every build)."""
+    var present = Dict[String, Bool]()
     for ref f in files:
-        present.append(f.rel_path.copy())
-        if f.rel_path.endswith(".html"):
-            html_files.append(f.copy())
+        present[f.rel_path] = True
     var problems = List[String]()
-    for ref f in html_files:
+    for ref f in files:
+        if not f.rel_path.endswith(".html"):
+            continue
         var ids = _extract_attr_values(f.content, "id")
         var links = _extract_attr_values(f.content, "href")
         var srcs = _extract_attr_values(f.content, "src")
@@ -91,18 +91,14 @@ def check_output(output_dir: String) raises -> List[String]:
             var target_rel = f.rel_path.copy()
             if path_part != "":
                 target_rel = _resolve_path(f.rel_path, path_part)
-                var found = False
-                for ref p in present:
-                    if p == target_rel:
-                        found = True
+                var found = target_rel in present
                 if not found:
                     var idx_path = "index.html"
                     if target_rel != "":
                         idx_path = target_rel + "/index.html"
-                    for ref p in present:
-                        if p == idx_path:
-                            found = True
-                            target_rel = idx_path
+                    if idx_path in present:
+                        found = True
+                        target_rel = idx_path
                 if not found:
                     problems.append(
                         f.rel_path + ": broken link '" + url + "'"
@@ -112,8 +108,10 @@ def check_output(output_dir: String) raises -> List[String]:
                 var target_ids = ids.copy()
                 if target_rel != f.rel_path:
                     target_ids = List[String]()
-                    for ref tf in html_files:
-                        if tf.rel_path == target_rel:
+                    for ref tf in files:
+                        if tf.rel_path == target_rel and tf.rel_path.endswith(
+                            ".html"
+                        ):
                             target_ids = _extract_attr_values(tf.content, "id")
                 var ok = False
                 for ref tid in target_ids:
@@ -124,3 +122,10 @@ def check_output(output_dir: String) raises -> List[String]:
                         f.rel_path + ": missing anchor '#" + frag + "'"
                     )
     return problems^
+
+
+def check_output(output_dir: String) raises -> List[String]:
+    """Standalone check of an existing output tree on disk."""
+    var files = List[OutputFile]()
+    _collect_tree(output_dir, String(), files, 0)
+    return check_files(files)

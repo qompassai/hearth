@@ -175,7 +175,7 @@ def _render_shortcode(
     args: Value,
     body_html: String,
     has_body: Bool,
-    env: TemplateEnv,
+    mut env: TemplateEnv,
     base_url: String,
 ) raises -> String:
     var ctx = args.copy()
@@ -188,8 +188,12 @@ def _render_shortcode(
 
 
 def expand_shortcodes(
-    body: String, env: TemplateEnv, base_url: String
+    var body: String, mut env: TemplateEnv, base_url: String
 ) raises -> String:
+    # Fast path: no shortcode opener anywhere, so the fence-tracking
+    # scan below cannot change a single byte.
+    if body.find("{{") == -1 and body.find("{%") == -1:
+        return body^
     var bytes = body.as_bytes()
     var n = len(bytes)
     var out = String()

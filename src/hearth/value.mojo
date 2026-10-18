@@ -128,35 +128,33 @@ struct Value(Copyable, Movable):
         return self.kind() == V_NONE
 
     def truthy(self) -> Bool:
-        var n = self._node()
-        if n.kind == V_NONE:
+        var kind = self.nodes[self.root].kind
+        if kind == V_NONE:
             return False
-        if n.kind == V_BOOL:
-            return n.b
-        if n.kind == V_INT:
-            return n.i != 0
-        if n.kind == V_FLOAT:
-            return n.f != 0.0
-        if n.kind == V_STRING:
-            return n.s.byte_length() > 0
-        if n.kind == V_LIST or n.kind == V_DICT:
-            return len(n.children) > 0
+        if kind == V_BOOL:
+            return self.nodes[self.root].b
+        if kind == V_INT:
+            return self.nodes[self.root].i != 0
+        if kind == V_FLOAT:
+            return self.nodes[self.root].f != 0.0
+        if kind == V_STRING:
+            return self.nodes[self.root].s.byte_length() > 0
+        if kind == V_LIST or kind == V_DICT:
+            return len(self.nodes[self.root].children) > 0
         return False
 
     def as_bool(self) -> Bool:
         return self.nodes[self.root].b
 
     def as_int(self) -> Int:
-        var n = self._node()
-        if n.kind == V_FLOAT:
-            return Int(n.f)
-        return n.i
+        if self.nodes[self.root].kind == V_FLOAT:
+            return Int(self.nodes[self.root].f)
+        return self.nodes[self.root].i
 
     def as_float(self) -> Float64:
-        var n = self._node()
-        if n.kind == V_INT:
-            return Float64(n.i)
-        return n.f
+        if self.nodes[self.root].kind == V_INT:
+            return Float64(self.nodes[self.root].i)
+        return self.nodes[self.root].f
 
     def as_string(self) -> String:
         return self.nodes[self.root].s.copy()
@@ -168,69 +166,80 @@ struct Value(Copyable, Movable):
         self.nodes[self.root].raw = raw
 
     def length(self) -> Int:
-        var n = self._node()
-        if n.kind == V_STRING:
-            return n.s.byte_length()
-        if n.kind == V_LIST or n.kind == V_DICT:
-            return len(n.children)
+        var kind = self.nodes[self.root].kind
+        if kind == V_STRING:
+            return self.nodes[self.root].s.byte_length()
+        if kind == V_LIST or kind == V_DICT:
+            return len(self.nodes[self.root].children)
         return 0
 
     def _extract(self, idx: Int) -> Value:
-        """Materialise the subtree at arena index `idx` as its own Value."""
+        """Materialise the subtree at arena index `idx` as its own Value.
+
+        The remap table covers only the subtree (visit order), never the
+        whole arena: extraction cost stays proportional to the subtree,
+        which is what keeps `get`/`at` cheap on site-sized contexts."""
         var out = Value()
         out.nodes.clear()
-        var map = List[Int]()
-        for _ in range(len(self.nodes)):
-            map.append(-1)
+        var old_ids = List[Int]()
         var stack = List[Int]()
         stack.append(idx)
-        map[idx] = 0
-        var order = List[Int]()
         while len(stack) > 0:
             var cur = stack.pop()
-            order.append(cur)
-            var node = self.nodes[cur].copy()
-            var new_idx = len(out.nodes)
-            map[cur] = new_idx
-            out.nodes.append(node^)
+            old_ids.append(cur)
+            out.nodes.append(self.nodes[cur].copy())
             for c in self.nodes[cur].children:
                 stack.append(c)
-        for k in range(len(out.nodes)):
-            for j in range(len(out.nodes[k].children)):
-                out.nodes[k].children[j] = map[out.nodes[k].children[j]]
+        if len(old_ids) > 32:
+            var map = Dict[Int, Int]()
+            for t in range(len(old_ids)):
+                map[old_ids[t]] = t
+            for k in range(len(out.nodes)):
+                for j in range(len(out.nodes[k].children)):
+                    out.nodes[k].children[j] = map.get(
+                        out.nodes[k].children[j], -1
+                    )
+        else:
+            for k in range(len(out.nodes)):
+                for j in range(len(out.nodes[k].children)):
+                    var old = out.nodes[k].children[j]
+                    for t in range(len(old_ids)):
+                        if old_ids[t] == old:
+                            out.nodes[k].children[j] = t
+                            break
         out.root = 0
         return out^
 
     def get(self, key: String) -> Value:
         """Dict lookup; a missing key yields none (never raises)."""
-        var n = self._node()
-        if n.kind != V_DICT:
+        if self.nodes[self.root].kind != V_DICT:
             return Value.none()
-        for j in range(len(n.keys)):
-            if n.keys[j] == key:
-                return self._extract(n.children[j])
+        for j in range(len(self.nodes[self.root].keys)):
+            if self.nodes[self.root].keys[j] == key:
+                return self._extract(self.nodes[self.root].children[j])
         return Value.none()
 
     def has(self, key: String) -> Bool:
-        var n = self._node()
-        if n.kind != V_DICT:
+        if self.nodes[self.root].kind != V_DICT:
             return False
-        for j in range(len(n.keys)):
-            if n.keys[j] == key:
+        for j in range(len(self.nodes[self.root].keys)):
+            if self.nodes[self.root].keys[j] == key:
                 return True
         return False
 
     def keys(self) -> List[String]:
-        var n = self._node()
         var out = List[String]()
-        for ref k in n.keys:
-            out.append(k.copy())
+        if self.nodes[self.root].kind == V_DICT:
+            for ref k in self.nodes[self.root].keys:
+                out.append(k.copy())
         return out^
 
     def at(self, idx: Int) -> Value:
-        var n = self._node()
-        if (n.kind == V_LIST or n.kind == V_DICT) and 0 <= idx < len(n.children):
-            return self._extract(n.children[idx])
+        var kind = self.nodes[self.root].kind
+        if (kind == V_LIST or kind == V_DICT) and (
+            0 <= idx < len(self.nodes[self.root].children)
+        ):
+            return self._extract(self.nodes[self.root].children[idx])
         return Value.none()
 
     def set(mut self, key: String, var value: Value):
@@ -253,42 +262,46 @@ struct Value(Copyable, Movable):
     def to_display(self) -> String:
         """Scalar rendering used by template output: strings as-is, numbers
         in plain form, bools as true/false, none and containers as empty."""
-        var n = self._node()
-        if n.kind == V_STRING:
-            return n.s.copy()
-        if n.kind == V_BOOL:
-            return String("true") if n.b else String("false")
-        if n.kind == V_INT:
-            return String(n.i)
-        if n.kind == V_FLOAT:
-            return String(n.f)
+        var kind = self.nodes[self.root].kind
+        if kind == V_STRING:
+            return self.nodes[self.root].s.copy()
+        if kind == V_BOOL:
+            return String("true") if self.nodes[self.root].b else String("false")
+        if kind == V_INT:
+            return String(self.nodes[self.root].i)
+        if kind == V_FLOAT:
+            return String(self.nodes[self.root].f)
         return String()
 
     def equals(self, other: Value) -> Bool:
-        var a = self._node()
-        var b = other._node()
-        if a.kind != b.kind:
-            if (a.kind == V_INT and b.kind == V_FLOAT) or (
-                a.kind == V_FLOAT and b.kind == V_INT
+        var a_kind = self.nodes[self.root].kind
+        var b_kind = other.nodes[other.root].kind
+        if a_kind != b_kind:
+            if (a_kind == V_INT and b_kind == V_FLOAT) or (
+                a_kind == V_FLOAT and b_kind == V_INT
             ):
                 return self.as_float() == other.as_float()
             return False
-        if a.kind == V_BOOL:
-            return a.b == b.b
-        if a.kind == V_INT:
-            return a.i == b.i
-        if a.kind == V_FLOAT:
-            return a.f == b.f
-        if a.kind == V_STRING:
-            return a.s == b.s
-        if a.kind == V_NONE:
+        if a_kind == V_BOOL:
+            return self.nodes[self.root].b == other.nodes[other.root].b
+        if a_kind == V_INT:
+            return self.nodes[self.root].i == other.nodes[other.root].i
+        if a_kind == V_FLOAT:
+            return self.nodes[self.root].f == other.nodes[other.root].f
+        if a_kind == V_STRING:
+            return self.nodes[self.root].s == other.nodes[other.root].s
+        if a_kind == V_NONE:
             return True
-        if a.kind == V_LIST or a.kind == V_DICT:
-            if len(a.children) != len(b.children):
+        if a_kind == V_LIST or a_kind == V_DICT:
+            if len(self.nodes[self.root].children) != len(
+                other.nodes[other.root].children
+            ):
                 return False
-            if a.kind == V_DICT and a.keys != b.keys:
+            if a_kind == V_DICT and (
+                self.nodes[self.root].keys != other.nodes[other.root].keys
+            ):
                 return False
-            for j in range(len(a.children)):
+            for j in range(len(self.nodes[self.root].children)):
                 if not self.at(j).equals(other.at(j)):
                     return False
             return True

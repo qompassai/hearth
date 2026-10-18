@@ -82,18 +82,25 @@ def escape_html(s: String) -> String:
 struct TemplateEnv(Copyable, Movable):
     var names: List[String]
     var sources: List[String]
+    var docs: List[Doc]
+    var doc_valid: List[Bool]
 
     def __init__(out self):
         self.names = _stops("")
         self.sources = _stops("")
+        self.docs = List[Doc]()
+        self.doc_valid = List[Bool]()
 
     def add(mut self, name: String, source: String):
         for i in range(len(self.names)):
             if self.names[i] == name:
                 self.sources[i] = source.copy()
+                self.doc_valid[i] = False
                 return
         self.names.append(name.copy())
         self.sources.append(source.copy())
+        self.docs.append(Doc())
+        self.doc_valid.append(False)
 
     def get(self, name: String) raises -> String:
         for i in range(len(self.names)):
@@ -106,6 +113,19 @@ struct TemplateEnv(Copyable, Movable):
             if n == name:
                 return True
         return False
+
+    def parsed(mut self, name: String) raises -> Doc:
+        """The named template parsed, cached across renders (a build
+        renders the page template once per page; parsing must not be
+        per-render work). Returns a copy: the extends path rewires the
+        doc it renders, and that must not poison the cache."""
+        for i in range(len(self.names)):
+            if self.names[i] == name:
+                if not self.doc_valid[i]:
+                    self.docs[i] = parse_template(self.sources[i].copy())
+                    self.doc_valid[i] = True
+                return self.docs[i].copy()
+        raise Error("template not found: " + name)
 
 
 struct TNode(Copyable, Movable):
@@ -1017,7 +1037,7 @@ def _render_nodes(
     node: Int,
     mut ctx: Value,
     mut scopes: List[Value],
-    env: TemplateEnv,
+    mut env: TemplateEnv,
     base_url: String,
     depth: Int,
 ) raises -> String:
@@ -1088,7 +1108,7 @@ def _render_nodes(
     if n.kind == N_INCLUDE:
         if depth + 1 > MAX_INCLUDE_DEPTH:
             raise Error("template: include depth bound exceeded")
-        var sub = parse_template(env.get(n.text))
+        var sub = env.parsed(n.text)
         _check_no_extends(sub)
         return _render_nodes(sub, sub.root, ctx, scopes, env, base_url, depth + 1)
     raise Error("template: cannot render node kind " + String(n.kind))
@@ -1101,17 +1121,17 @@ def _check_no_extends(doc: Doc) raises:
 
 
 def render_parsed(
-    doc: Doc, mut ctx: Value, env: TemplateEnv, base_url: String
+    doc: Doc, mut ctx: Value, mut env: TemplateEnv, base_url: String
 ) raises -> String:
     var scopes = List[Value]()
     return _render_nodes(doc, doc.root, ctx, scopes, env, base_url, 0)
 
 
 def render_template(
-    name: String, mut ctx: Value, env: TemplateEnv, base_url: String
+    name: String, mut ctx: Value, mut env: TemplateEnv, base_url: String
 ) raises -> String:
     """Render the named template, resolving one level of extends."""
-    var doc = parse_template(env.get(name))
+    var doc = env.parsed(name)
     var extends_name = String()
     for ref nd in doc.nodes[doc.root].children:
         if doc.nodes[nd].kind == N_EXTENDS:
@@ -1142,7 +1162,7 @@ def render_template(
 
 
 def render_string(
-    source: String, mut ctx: Value, env: TemplateEnv, base_url: String
+    source: String, mut ctx: Value, mut env: TemplateEnv, base_url: String
 ) raises -> String:
     var doc = parse_template(source)
     _check_no_extends(doc)

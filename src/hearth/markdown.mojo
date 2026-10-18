@@ -879,7 +879,7 @@ def _def_gate(
         return True
     if _atx_heading(prev)[0] or _is_thematic_break(prev):
         return True
-    if _fence_start(prev)[0]:
+    if _fence_check(prev)[0]:
         return True
     return False
 
@@ -938,12 +938,21 @@ def _collect_refs(
                 consumed[idx] = True
                 idx += 1
                 continue
-        var stripped = _bq_strip(line)
-        var pc = stripped[0]
-        var first = _first_nonspace_byte(stripped[1]) if pc > 0 else _first_nonspace_byte(line)
+        # Cheap gate for the strip: a prefix exists only when the line
+        # starts (after at most 3 spaces) with '>'.
+        var pc = 0
+        var stripped_text = line
+        var sp = 0
+        while sp < len(bytes) and bytes[sp] == 0x20 and sp < 3:
+            sp += 1
+        if sp < len(bytes) and bytes[sp] == 0x3E:
+            var stripped = _bq_strip(line)
+            pc = stripped[0]
+            stripped_text = stripped[1].copy()
+        var first = _first_nonspace_byte(stripped_text) if pc > 0 else _first_nonspace_byte(line)
         if first == 0x5B and _def_gate(lines, consumed, idx, last_def_end):
             var texts = List[String]()
-            texts.append(stripped[1] if pc > 0 else line)
+            texts.append(stripped_text if pc > 0 else line)
             var cend = idx + 1
             while cend < len(lines):
                 var nl = lines[cend]
@@ -1078,6 +1087,32 @@ def _fence_start(line: String) -> Tuple[Bool, UInt8, Int, String]:
     if ch == 0x60 and info.find("`") != -1:
         return (False, UInt8(0), 0, String())
     return (True, ch, run, info^)
+
+
+def _fence_check(line: String) -> Tuple[Bool, UInt8, Int]:
+    """Fence detection without the info-string allocation, for the
+    many speculative call sites that only need (is-fence, char, run)."""
+    var bytes = line.as_bytes()
+    var n = len(bytes)
+    var i = 0
+    while i < n and bytes[i] == 0x20 and i < 3:
+        i += 1
+    if i >= n:
+        return (False, UInt8(0), 0)
+    var ch = bytes[i]
+    if ch != 0x60 and ch != 0x7E:
+        return (False, UInt8(0), 0)
+    var run = 0
+    while i < n and bytes[i] == ch:
+        run += 1
+        i += 1
+    if run < 3:
+        return (False, UInt8(0), 0)
+    if ch == 0x60:
+        var info = _sub(line, i, n)
+        if info.find("`") != -1:
+            return (False, UInt8(0), 0)
+    return (True, ch, run)
 
 
 def _is_thematic_break(line: String) -> Bool:
@@ -1388,7 +1423,7 @@ def _starts_new_block(line: String) -> Bool:
     the container, not here."""
     if _is_blank(line):
         return False
-    if _fence_start(line)[0] or _atx_heading(line)[0]:
+    if _fence_check(line)[0] or _atx_heading(line)[0]:
         return True
     if _is_thematic_break(line) or _html_block_type(line) > 0:
         return True
@@ -1401,7 +1436,7 @@ def _starts_new_block(line: String) -> Bool:
 def _block_starts(line: String, consumed: Bool) -> Bool:
     if consumed or _is_blank(line):
         return True
-    if _fence_start(line)[0] or _atx_heading(line)[0]:
+    if _fence_check(line)[0] or _atx_heading(line)[0]:
         return True
     if _is_thematic_break(line):
         return True
@@ -1572,7 +1607,7 @@ def _leaf_is_paragraph(line: String) -> Bool:
     lazily. Blank lines and every block start close the paragraph."""
     if _is_blank(line) or _leading_spaces(line) >= 4:
         return False
-    if _fence_start(line)[0] or _atx_heading(line)[0]:
+    if _fence_check(line)[0] or _atx_heading(line)[0]:
         return False
     if _is_thematic_break(line) or _html_block_type(line) > 0:
         return False
@@ -1605,7 +1640,7 @@ def _fence_track(
         ):
             return (False, fence_char, fence_len)
         return (True, fence_char, fence_len)
-    var fs = _fence_start(content)
+    var fs = _fence_check(content)
     if fs[0]:
         return (True, fs[1], fs[2])
     return (False, fence_char, fence_len)
@@ -2125,7 +2160,9 @@ def render_blocks(
 def render_markdown(source: String, site_extensions: Bool = False) raises -> MdResult:
     if source.byte_length() > MAX_INPUT_BYTES:
         raise Error("markdown: input exceeds size bound")
-    var clean = source.replace("\x00", "�")
+    var clean = source
+    if clean.find("\x00") != -1:
+        clean = clean.replace("\x00", "�")
     var lines = _split_lines(clean)
     var collected = _collect_refs(lines)
     var ctx = Ctx(collected[0], site_extensions)
@@ -7396,9 +7433,34 @@ def render_inline(s: String, mut ctx: Ctx) -> String:
             text += _sub(s, i, j)
             i = j
             continue
-        # Ordinary text.
-        text += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
-        i += 1
+        # Ordinary text: consume the whole run up to the next byte any
+        # branch above dispatches on ('!' and '~' stop the run too --
+        # they fall back here when not followed by '[' / '~').
+        var run_end = i
+        while run_end < n:
+            var ob = bytes[run_end]
+            if (
+                ob == 0x5C
+                or ob == 0x60
+                or ob == 0x3C
+                or ob == 0x26
+                or ob == 0x5B
+                or ob == 0x5D
+                or ob == 0x2A
+                or ob == 0x5F
+                or ob == 0x20
+                or ob == 0x09
+                or ob == 0x21
+                or ob == 0x7E
+            ):
+                break
+            run_end += 1
+        if run_end == i:
+            # A lone '!' or '~' fell through its branch above; consume
+            # the single byte so the loop always makes progress.
+            run_end = i + 1
+        text += String(StringSlice(unsafe_from_utf8=bytes[i:run_end]))
+        i = run_end
     _flush_inline(text, nodes)
     _process_emphasis(nodes, -1)
     return _render_nodes(nodes, 0, len(nodes))
