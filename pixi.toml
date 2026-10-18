@@ -7,3 +7,9 @@ platforms = ["linux-64"]
 
 [dependencies]
 mojo = "==1.1.0"
+
+[tasks]
+build = "mojo build -I src -o build/hearth src/main.mojo"
+test = "mojo build -I src -o build/test_markdown tests/test_markdown.mojo && ./build/test_markdown && mojo build -I src -o build/test_templates tests/test_templates.mojo && ./build/test_templates && mojo build -I src -o build/test_frontmatter tests/test_frontmatter.mojo && ./build/test_frontmatter"
+conformance = "bash tools/run_commonmark.sh"
+bench = "bash tools/bench.sh"

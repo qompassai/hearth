@@ -8,11 +8,15 @@ The name is the fixed fire at the center of the home; a site generator builds ho
 
 ## Status
 
-**Phase 0 — spec, frozen corpus, and baselines.** No generator code exists yet. Phase 1 (the core pipeline) starts on the spec's terms; see `SPEC.md` §6.
+**Phase 1 — in progress (branch `phase1/spikes-and-skeleton`).** The spec was ratified 2026-10-17. The adoption spikes rejected both upstream candidates (see `spikes/SPIKES.md`), so the pipeline is Hearth's own code: Markdown engine, Tera-subset template engine, TOML-subset config, shortcodes, and an atomic build with link checking. Measured 2026-10-17 on primo: unit tests 44/44; CommonMark conformance **429/652** (failing examples named in the conformance runner's output; the deep items are the delimiter-stack emphasis algorithm, list container state, the full HTML5 entity table, and Unicode label folding); fixture output **DOM-equivalent to the pinned Zola** (kintsugi-page 2/2 pages; bench-1000 1001/1002 pages — the one difference is section page-link order, which the pinned Zola itself does not reproduce deterministically); bench medians: kintsugi-page 10 ms (baseline 12 ms), bench-1000 ~140 ms (baseline 126 ms — gate 3 not yet met); determinism byte-identical; peak RSS ≤ 54 MB. Gates 1 and 3 remain open; see `SPEC.md` §4.
 
 ## What's here
 
-- **`SPEC.md`** — the governing spec (draft v0.1): purpose, the parity definition, gates and baselines, architecture, non-goals, and the toolchain discipline.
+- **`SPEC.md`** — the governing spec (ratified v0.1): purpose, the parity definition, gates and baselines, architecture, non-goals, and the toolchain discipline.
+- **`src/`** — the generator: `src/main.mojo` (CLI) and the `src/hearth/` package (build orchestration, Markdown, templates, config, scan, shortcodes, assets, output-tree swap, link check).
+- **`spikes/`** — the Phase 1 adoption-spike record (both candidates evaluated on the pinned Mojo 1.1.0 and rejected with evidence).
+- **`tools/`** — the corpus gate runner (`run_commonmark.sh` + conformance driver + spec-case extractor) and the bench/determinism harness (`bench.sh`).
+- **`tests/`** — unit tests (Markdown, templates, front matter), run via `pixi run test`.
 - **`corpus/`** — the frozen evaluation corpus (frozen 2026-10-16): the CommonMark 0.31.2 spec suite (652 examples), the Kintsugi publication page as built by the pinned Zola 0.22.1 reference, and a deterministic 1,000-page bench site. `corpus/MANIFEST.sha256` carries 1,012 SHA-256 entries; every corpus file verifies against it. (The manifest's self-entry cannot verify against its own contents — a known artifact of how it was generated, recorded here rather than silently edited: changing any corpus file requires a spec amendment and re-baselining, per `SPEC.md` §2.)
 - **`pixi.toml` / `pixi.lock`** — the pinned Mojo toolchain (below).
 
