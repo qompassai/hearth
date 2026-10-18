@@ -233,9 +233,91 @@ def _leading_spaces(line: String) -> Int:
     return col
 
 
+def _column_at(line: String, byte_idx: Int) -> Int:
+    """Column of the byte at `byte_idx`, expanding tabs to 4-stops.
+    Only used on prefixes of spaces, tabs, and single marker bytes, so
+    counting one column per other byte is exact there."""
+    var bytes = line.as_bytes()
+    var col = 0
+    var stop = byte_idx
+    if stop > len(bytes):
+        stop = len(bytes)
+    for i in range(stop):
+        if bytes[i] == 0x09:
+            col += 4 - (col % 4)
+        else:
+            col += 1
+    return col
+
+
+def _content_after(
+    line: String, start_byte: Int, start_col: Int, target_col: Int
+) -> String:
+    """The text of `line` from the point where column `target_col` is
+    reached, walking whitespace from byte `start_byte` (which sits at
+    column `start_col`). A tab straddling the target contributes its
+    remaining columns as spaces, and tabs inside the remaining leading
+    whitespace run expand at their true width — so the result obeys
+    leading_spaces(result) == leading_spaces(line) - target_col.
+    Consumption stops at the first non-whitespace byte: columns inside
+    content are never invented, and content tabs stay literal."""
+    var bytes = line.as_bytes()
+    var n = len(bytes)
+    var out = String()
+    var col = start_col
+    var i = start_byte
+    while i < n and col < target_col:
+        var b = bytes[i]
+        if b == 0x20:
+            col += 1
+            i += 1
+        elif b == 0x09:
+            var width = 4 - (col % 4)
+            if col + width <= target_col:
+                col += width
+                i += 1
+            else:
+                for _ in range(col + width - target_col):
+                    out += " "
+                col = target_col
+                i += 1
+                break
+        else:
+            break
+    while i < n:
+        var b = bytes[i]
+        if b == 0x20:
+            out += " "
+            col += 1
+            i += 1
+        elif b == 0x09:
+            var width = 4 - (col % 4)
+            for _ in range(width):
+                out += " "
+            col += width
+            i += 1
+        else:
+            break
+    out += _sub(line, i, n)
+    return out^
+
+
 def _strip_columns(line: String, cols: Int) -> String:
-    """Remove up to `cols` columns of indentation; a tab straddling the
-    boundary is replaced by the spaces that remain past it."""
+    """Remove `cols` columns of indentation (see _content_after)."""
+    return _content_after(line, 0, 0, cols)
+
+
+def _lstrip_blanks(line: String) -> String:
+    """A line's content with all leading blanks removed (paragraph text
+    starts at the first non-blank, however deep the indent)."""
+    return _content_after(line, 0, 0, 1 << 30)
+
+
+def _strip_columns_raw(line: String, cols: Int) -> String:
+    """Remove `cols` columns of indentation for terminal code content:
+    only a tab straddling the boundary is materialized (as its
+    remaining spaces); every other byte, tabs included, stays literal,
+    exactly as the reference renderers emit code content."""
     var bytes = line.as_bytes()
     var col = 0
     var i = 0
@@ -654,18 +736,26 @@ def _is_thematic_break(line: String) -> Bool:
 
 
 def _setext_level(line: String) -> Int:
+    """A setext underline is a run of = (level 1) or - (level 2) with up
+    to 3 leading spaces and nothing but trailing spaces/tabs after the
+    run — no spaces inside the run."""
     var bytes = line.as_bytes()
-    if len(bytes) == 0 or _leading_spaces(line) >= 4:
+    var n = len(bytes)
+    if n == 0 or _leading_spaces(line) >= 4:
         return 0
-    var ch = bytes[_first_nonspace(line)]
+    var i = _first_nonspace(line)
+    if i >= n:
+        return 0
+    var ch = bytes[i]
     if ch != 0x3D and ch != 0x2D:
         return 0
-    for i in range(len(bytes)):
-        var b = bytes[i]
-        if b == 0x20 or b == 0x09:
-            continue
-        if b != ch:
+    var j = i
+    while j < n and bytes[j] == ch:
+        j += 1
+    while j < n:
+        if bytes[j] != 0x20 and bytes[j] != 0x09:
             return 0
+        j += 1
     return 1 if ch == 0x3D else 2
 
 
@@ -684,6 +774,9 @@ struct ListMarker(Copyable, Movable):
     var bullet: UInt8  # bullet char, or the ordered delimiter (. or ))
     var indent: Int  # columns of indentation before the marker
     var content_col: Int  # column where item content starts
+    var end_byte: Int  # byte index just past the marker
+    var end_col: Int  # column just past the marker
+    var blank: Bool  # nothing but whitespace follows the marker
 
     def __init__(out self):
         self.ok = False
@@ -692,6 +785,48 @@ struct ListMarker(Copyable, Movable):
         self.bullet = 0
         self.indent = 0
         self.content_col = 0
+        self.end_byte = 0
+        self.end_col = 0
+        self.blank = False
+
+
+def _finish_marker(line: String, mut m: ListMarker):
+    """Compute the content column from the whitespace following the
+    marker, counted in columns one at a time (tabs partially) exactly
+    as the spec prescribes: 1-4 columns of following whitespace put the
+    content at marker end + that many columns; 5 or more, or a blank
+    remainder, put it at marker end + 1."""
+    var bytes = line.as_bytes()
+    var n = len(bytes)
+    var col = m.end_col
+    var j = m.end_byte
+    var ws = 0
+    while j < n and ws < 5:
+        var b = bytes[j]
+        if b == 0x20:
+            ws += 1
+            col += 1
+            j += 1
+        elif b == 0x09:
+            var width = 4 - (col % 4)
+            var step = width if width < 5 - ws else 5 - ws
+            ws += step
+            col += step
+            if step == width:
+                j += 1
+            else:
+                break
+        else:
+            break
+    if j >= n:
+        m.blank = True
+        m.content_col = m.end_col + 1
+    elif ws == 0:
+        m.ok = False
+    elif ws >= 5:
+        m.content_col = m.end_col + 1
+    else:
+        m.content_col = m.end_col + ws
 
 
 def _list_marker(line: String) -> ListMarker:
@@ -706,24 +841,13 @@ def _list_marker(line: String) -> ListMarker:
         return m^
     var b = bytes[i]
     if b == 0x2D or b == 0x2B or b == 0x2A:
-        if i + 1 < n and not _is_space(bytes[i + 1]):
-            return m^
         m.ok = True
         m.ordered = False
         m.bullet = b
         m.indent = indent
-        # Content column: marker at column `indent`, 1 wide, then spaces.
-        var spaces = 0
-        var j = i + 1
-        while j < n and bytes[j] == 0x20:
-            spaces += 1
-            j += 1
-        if spaces == 0:
-            m.content_col = indent + 2
-        elif spaces > 4:
-            m.content_col = indent + 2
-        else:
-            m.content_col = indent + 1 + spaces
+        m.end_byte = i + 1
+        m.end_col = indent + 1
+        _finish_marker(line, m)
         return m^
     if _is_digit(b):
         var num = 0
@@ -737,50 +861,24 @@ def _list_marker(line: String) -> ListMarker:
             return m^
         if bytes[j] != 0x2E and bytes[j] != 0x29:
             return m^
-        if j + 1 < n and not _is_space(bytes[j + 1]):
-            return m^
         m.ok = True
         m.ordered = True
         m.number = num
         m.bullet = bytes[j]
         m.indent = indent
-        var width = digits + 1
-        var spaces = 0
-        var k = j + 1
-        while k < n and bytes[k] == 0x20:
-            spaces += 1
-            k += 1
-        if spaces == 0 or spaces > 4:
-            m.content_col = indent + width + 1
-        else:
-            m.content_col = indent + width + spaces
+        m.end_byte = j + 1
+        m.end_col = indent + digits + 1
+        _finish_marker(line, m)
         return m^
     return m^
 
 
 def _item_content(line: String, m: ListMarker) -> String:
     """The item's first content line: the text at the marker's content
-    column. (_strip_columns alone cannot do this — the marker itself is
-    not indentation.)"""
-    var bytes = line.as_bytes()
-    var i = _first_nonspace(line)
-    if m.ordered:
-        while i < len(bytes) and _is_digit(bytes[i]):
-            i += 1
-        i += 1  # the delimiter
-    else:
-        i += 1  # the bullet
-    var col = m.indent + (i - _first_nonspace(line))
-    while i < len(bytes) and col < m.content_col:
-        if bytes[i] == 0x20:
-            col += 1
-            i += 1
-        elif bytes[i] == 0x09:
-            col += 4 - (col % 4)
-            i += 1
-        else:
-            break
-    return _sub(line, i, len(bytes))
+    column, reached by walking columns from the marker's end."""
+    if m.blank:
+        return String()
+    return _content_after(line, m.end_byte, m.end_col, m.content_col)
 
 
 def _html_block_start(line: String) -> Bool:
@@ -1074,7 +1172,7 @@ def render_blocks(
                 var rest = String(_sub(lines[j], p, len(f2)).strip())
                 if run >= fence[2] and rest == "" and _leading_spaces(lines[j]) < 4:
                     break
-                content += _strip_columns(lines[j], fence_indent) + "\n"
+                content += _strip_columns_raw(lines[j], fence_indent) + "\n"
                 j += 1
             var info = fence[3]
             var first_word = _unescape_backslash(String(info.split(" ")[0])) if info != "" else String()
@@ -1122,9 +1220,21 @@ def render_blocks(
                     and qp < ql.byte_length()
                     and ql.as_bytes()[qp] == 0x3E
                 ):
-                    var stripped = _sub(ql, qp + 1, ql.byte_length())
-                    if stripped.startswith(" "):
-                        stripped = _sub(stripped, 1, stripped.byte_length())
+                    var after = qp + 1
+                    var stripped: String
+                    if (
+                        after < ql.byte_length()
+                        and (
+                            ql.as_bytes()[after] == 0x20
+                            or ql.as_bytes()[after] == 0x09
+                        )
+                    ):
+                        # The marker may be followed by one column of
+                        # whitespace (a tab counts as one column here).
+                        var acol = _column_at(ql, after)
+                        stripped = _content_after(ql, after, acol, acol + 1)
+                    else:
+                        stripped = _sub(ql, after, ql.byte_length())
                     inner_lines.append(stripped^)
                     j += 1
                     continue
@@ -1167,7 +1277,7 @@ def render_blocks(
                 for _ in range(pending_blanks):
                     content += "\n"
                 pending_blanks = 0
-                content += _strip_columns(lines[j], 4) + "\n"
+                content += _strip_columns_raw(lines[j], 4) + "\n"
                 j += 1
             out += "<pre><code>" + escape_text(content) + "</code></pre>\n"
             i = j
@@ -1202,8 +1312,15 @@ def render_blocks(
                     break
             if j > i:
                 text += "\n"
-            text += _strip_columns(lines[j], 3)
+            text += _lstrip_blanks(lines[j])
             j += 1
+        # Trailing blanks of the paragraph's last line are not content.
+        while text.byte_length() > 0:
+            var last = text.as_bytes()[text.byte_length() - 1]
+            if last == 0x20 or last == 0x09:
+                text = _sub(text, 0, text.byte_length() - 1)
+            else:
+                break
         if setext > 0:
             var inner = render_inline(text, ctx)
             var id = ctx.unique_id(_plain_text(inner))
