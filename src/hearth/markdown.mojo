@@ -1235,39 +1235,150 @@ def _item_content(line: String, m: ListMarker) -> String:
     return _content_after(line, m.end_byte, m.end_col, m.content_col)
 
 
-def _html_block_start(line: String) -> Bool:
+def _tag_name_at(s: String, pos: Int) -> Tuple[String, Int]:
+    """Read a tag name at `pos` (letters, digits, hyphens), returned
+    ASCII-lowercased with the index just past it; empty if none."""
+    var bytes = s.as_bytes()
+    var j = pos
+    var name = String()
+    while j < len(bytes) and (
+        _is_alpha(bytes[j]) or _is_digit(bytes[j]) or bytes[j] == 0x2D
+    ):
+        name += String(
+            StringSlice(unsafe_from_utf8=bytes[j : j + 1])
+        ) if bytes[j] < 0x41 or bytes[j] > 0x5A else _sub(
+            "abcdefghijklmnopqrstuvwxyz",
+            Int(bytes[j]) - 0x41,
+            Int(bytes[j]) - 0x41 + 1,
+        )
+        j += 1
+    return (name^, j)
+
+
+def _is_block_tag(name: String) -> Bool:
+    """The type-6 HTML block tag list (lowercase names)."""
+    comptime NAMES = (
+        "|address|article|aside|base|basefont|blockquote|body|caption"
+        "|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset"
+        "|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5"
+        "|h6|head|header|hr|html|iframe|legend|li|link|main|menu"
+        "|menuitem|nav|noframes|ol|optgroup|option|p|param|search"
+        "|section|summary|table|tbody|td|tfoot|th|thead|title|tr"
+        "|track|ul|"
+    )
+    var haystack = String(NAMES)
+    var target = String("|") + name + "|"
+    var tlen = target.byte_length()
+    for i in range(haystack.byte_length() - tlen + 1):
+        if _sub(haystack, i, i + tlen) == target:
+            return True
+    return False
+
+
+def _contains_fold(s: String, needle: String) -> Bool:
+    """Whether `s` contains `needle` (lowercase ASCII) under ASCII
+    case folding."""
+    var sb = s.as_bytes()
+    var nb = needle.as_bytes()
+    if len(nb) == 0 or len(sb) < len(nb):
+        return len(nb) == 0
+    for i in range(len(sb) - len(nb) + 1):
+        var ok = True
+        for k in range(len(nb)):
+            var c = Int(sb[i + k])
+            if 0x41 <= c and c <= 0x5A:
+                c = c + 0x20
+            if c != Int(nb[k]):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _html_block_type(line: String) -> Int:
+    """The CommonMark HTML block type a line starts (1-7), or 0.
+    The line may carry up to three leading spaces."""
     var i = _first_nonspace(line)
     var bytes = line.as_bytes()
-    if _leading_spaces(line) >= 4 or i + 1 >= len(bytes):
-        return False
-    if bytes[i] != 0x3C:
-        return False
-    var c = bytes[i + 1]
-    if c == 0x21 or c == 0x3F:
-        return True
-    if c == 0x2F:
-        return i + 2 < len(bytes) and _is_alpha(bytes[i + 2])
-    if not _is_alpha(c):
-        return False
-    # Distinguish a lone autolink <scheme:...> from a tag: an autolink has
-    # a ':' before any space, '=', or '>'.
+    var n = len(bytes)
+    if _leading_spaces(line) > 3 or i >= n or bytes[i] != 0x3C:
+        return 0
+    var rest = _sub(line, i, n)
+    if rest.startswith("<!--"):
+        return 2
+    if rest.startswith("<?"):
+        return 3
+    if rest.startswith("<![CDATA["):
+        return 5
+    if rest.startswith("<!"):
+        if i + 2 < n and _is_alpha(bytes[i + 2]):
+            return 4
+        return 0
     var j = i + 1
-    while j < len(bytes):
-        var b = bytes[j]
-        if b == 0x3A:
-            return False
-        if b == 0x20 or b == 0x3D or b == 0x3E or b == 0x2F:
-            return True
+    var closing = False
+    if j < n and bytes[j] == 0x2F:
+        closing = True
         j += 1
-    return True
+    var named = _tag_name_at(line, j)
+    var name = named[0]
+    var after = named[1]
+    if name == "":
+        return 0
+    var raw_tag = (
+        name == "pre" or name == "script" or name == "style" or name == "textarea"
+    )
+    if not closing and raw_tag:
+        if after >= n or bytes[after] == 0x20 or bytes[after] == 0x09 or bytes[after] == 0x3E:
+            return 1
+    if _is_block_tag(name):
+        if after >= n:
+            return 6
+        var b = bytes[after]
+        if b == 0x20 or b == 0x09 or b == 0x3E:
+            return 6
+        if b == 0x2F and after + 1 < n and bytes[after + 1] == 0x3E:
+            return 6
+    var tag_end = _scan_tag(line, i)
+    if tag_end != -1:
+        var k = tag_end
+        while k < n and (bytes[k] == 0x20 or bytes[k] == 0x09):
+            k += 1
+        if k >= n:
+            if not closing and raw_tag:
+                return 0
+            return 7
+    return 0
 
 
+def _html_end_line(line: String, block_type: Int) -> Bool:
+    """Whether a line meets the end condition of an HTML block of
+    types 1-5."""
+    if block_type == 1:
+        return (
+            _contains_fold(line, "</pre>")
+            or _contains_fold(line, "</script>")
+            or _contains_fold(line, "</style>")
+            or _contains_fold(line, "</textarea>")
+        )
+    if block_type == 2:
+        return line.find("-->") != -1
+    if block_type == 3:
+        return line.find("?>") != -1
+    if block_type == 4:
+        return line.find(">") != -1
+    if block_type == 5:
+        return line.find("]]>") != -1
+    return False
 def _block_starts(line: String, consumed: Bool) -> Bool:
     if consumed or _is_blank(line):
         return True
     if _fence_start(line)[0] or _atx_heading(line)[0]:
         return True
-    if _is_thematic_break(line) or _html_block_start(line):
+    if _is_thematic_break(line):
+        return True
+    var ht = _html_block_type(line)
+    if 1 <= ht and ht <= 6:
         return True
     if _list_marker(line).ok:
         return True
@@ -1625,13 +1736,23 @@ def render_blocks(
             out += "<blockquote>\n" + inner + "</blockquote>\n"
             i = j
             continue
-        # HTML block: raw until a blank line.
-        if _html_block_start(line):
+        # HTML block: types 1-5 run to their end-condition line
+        # (blank lines included); types 6-7 end at a blank line.
+        var html_type = _html_block_type(line)
+        if html_type > 0:
             var j = i
             var raw = String()
-            while j < hi and not _is_blank(lines[j]):
-                raw += lines[j] + "\n"
-                j += 1
+            if html_type <= 5:
+                while j < hi:
+                    raw += lines[j] + "\n"
+                    var done = _html_end_line(lines[j], html_type)
+                    j += 1
+                    if done:
+                        break
+            else:
+                while j < hi and not _is_blank(lines[j]):
+                    raw += lines[j] + "\n"
+                    j += 1
             out += raw
             i = j
             continue
@@ -2299,20 +2420,17 @@ def _process_emphasis(mut nodes: List[InNode], bottom: Int):
 
 
 def _scan_html_comment(s: String, start: Int) -> Int:
-    """Match an HTML comment at the '<' at `start` per the spec's
-    grammar: <!--, text that does not start with > or -> and contains
-    no dash followed by ->, then -->. Returns the index just past
-    the closing -->, or -1."""
-    var bytes = s.as_bytes()
-    var n = len(bytes)
-    var i = start + 4
-    if i >= n or bytes[i] == 0x3E or s.startswith("->", i):
+    """Match an HTML comment at the '<' at `start`: the abrupt
+    empty forms <!--> and <!--->, or <!--, text not including the
+    string -->, and -->. Returns the index just past -->, or -1."""
+    if s.startswith("<!-->", start):
+        return start + 5
+    if s.startswith("<!--->", start):
+        return start + 6
+    var close = s.find("-->", start + 4)
+    if close == -1:
         return -1
-    while i < n:
-        if bytes[i] == 0x2D and s.startswith("->", i + 1):
-            return i + 3
-        i += 1
-    return -1
+    return close + 3
 
 
 def _flush_inline(mut text: String, mut nodes: List[InNode]):
