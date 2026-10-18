@@ -473,6 +473,29 @@ def _decode_entities(s: String) -> String:
     return out^
 
 
+def _skip_link_ws(s: String, i: Int) -> Tuple[Int, Bool]:
+    """Skip the whitespace allowed between inline-link components:
+    spaces and tabs, plus at most one line ending (itself followed by
+    spaces and tabs). A second line ending is a blank line, which the
+    grammar does not allow between components."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var j = i
+    while j < n and (bytes[j] == 0x20 or bytes[j] == 0x09):
+        j += 1
+    if j < n and bytes[j] == 0x0D and j + 1 < n and bytes[j + 1] == 0x0A:
+        j += 1
+    if j < n and bytes[j] == 0x0A:
+        j += 1
+        while j < n and (bytes[j] == 0x20 or bytes[j] == 0x09):
+            j += 1
+        if j < n and bytes[j] == 0x0D and j + 1 < n and bytes[j + 1] == 0x0A:
+            j += 1
+        if j < n and bytes[j] == 0x0A:
+            return (j, False)
+    return (j, True)
+
+
 def _parse_link_dest_title(
     s: String, start: Int
 ) -> Tuple[Bool, String, String, Int]:
@@ -480,15 +503,26 @@ def _parse_link_dest_title(
     Returns (ok, dest, title, index just past ')')."""
     var bytes = s.as_bytes()
     var n = len(bytes)
-    var i = start + 1
-    while i < n and _is_space(bytes[i]):
-        i += 1
+    var skipped = _skip_link_ws(s, start + 1)
+    var i = skipped[0]
+    if not skipped[1]:
+        return (False, String(), String(), start)
     var dest = String()
     if i < n and bytes[i] == 0x3C:  # <...>
         var j = i + 1
-        while j < n and bytes[j] != 0x3E and bytes[j] != 0x0A:
+        var closed = False
+        while j < n:
+            var b = bytes[j]
+            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
+                j += 2
+                continue
+            if b == 0x3E:
+                closed = True
+                break
+            if b == 0x3C or b == 0x0A or b == 0x0D:
+                break
             j += 1
-        if j >= n:
+        if not closed:
             return (False, String(), String(), start)
         dest = _sub(s, i + 1, j)
         i = j + 1
@@ -497,10 +531,10 @@ def _parse_link_dest_title(
         var j = i
         while j < n:
             var b = bytes[j]
-            if b == 0x5C and j + 1 < n:
+            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
                 j += 2
                 continue
-            if _is_space(b) or b < UInt8(0x20):
+            if b <= UInt8(0x20):
                 break
             if b == 0x28:
                 depth += 1
@@ -509,27 +543,45 @@ def _parse_link_dest_title(
                     break
                 depth -= 1
             j += 1
+        if depth != 0:
+            return (False, String(), String(), start)
         dest = _sub(s, i, j)
         i = j
-    while i < n and _is_space(bytes[i]):
-        i += 1
+    var before_ws = i
+    skipped = _skip_link_ws(s, i)
+    i = skipped[0]
+    if not skipped[1]:
+        return (False, String(), String(), start)
     var title = String()
     if i < n and bytes[i] != 0x29:
+        # A title must be separated from the destination by whitespace.
+        if i == before_ws:
+            return (False, String(), String(), start)
         var q = bytes[i]
         if q != 0x22 and q != 0x27 and q != 0x28:
             return (False, String(), String(), start)
         var close: UInt8 = 0x29 if q == 0x28 else q
         var j = i + 1
-        while j < n and bytes[j] != close:
-            if bytes[j] == 0x5C and j + 1 < n:
-                j += 1
+        var closed = False
+        while j < n:
+            var b = bytes[j]
+            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
+                j += 2
+                continue
+            if q == 0x28 and b == 0x28:
+                break  # unescaped '(' inside a paren title
+            if b == close:
+                closed = True
+                break
             j += 1
-        if j >= n:
+        if not closed:
             return (False, String(), String(), start)
         title = _sub(s, i + 1, j)
         i = j + 1
-        while i < n and _is_space(bytes[i]):
-            i += 1
+        skipped = _skip_link_ws(s, i)
+        i = skipped[0]
+        if not skipped[1]:
+            return (False, String(), String(), start)
     if i < n and bytes[i] == 0x29:
         return (True, dest^, title^, i + 1)
     return (False, String(), String(), start)
@@ -1523,71 +1575,273 @@ def _link_html(
     return out2 + ">" + text_html + "</a>"
 
 
-def _try_link(
-    s: String, open_bracket: Int, image: Bool, mut ctx: Ctx
-) -> Tuple[Bool, String, Int]:
-    """Attempt a link/image starting at the '[' at `open_bracket`.
-    Returns (ok, html, index just past the construct)."""
-    var close = _find_bracket_close(s, open_bracket + 1)
-    if close == -1:
-        return (False, String(), open_bracket)
-    var text_src = _sub(s, open_bracket + 1, close)
-    var after = close + 1
+def _autolink_html(dest: String, display: String) -> String:
+    """An autolink: the destination between the brackets is literal
+    (no backslash processing); the display text is the address or
+    URI itself."""
+    var out = '<a href="' + escape_attr(encode_uri(_decode_entities(dest))) + '">'
+    return out + escape_text(display) + "</a>"
+
+
+def _scan_tag(s: String, start: Int) -> Int:
+    """Match an HTML tag at the '<' at `start` per the spec's tag
+    grammar (open and closing tags, attributes with unquoted, single-
+    or double-quoted values; values and inter-attribute whitespace
+    may span lines). Returns the index just past '>', or -1."""
     var bytes = s.as_bytes()
-    if after < len(bytes) and bytes[after] == 0x28:
-        var parsed = _parse_link_dest_title(s, after)
-        if parsed[0]:
-            var text_html = render_inline(text_src, ctx) if not image else _plain_text(render_inline(text_src, ctx))
-            return (True, _link_html(parsed[1], parsed[2], text_html, image), parsed[3])
-        # Not a valid inline link: fall through to the shortcut-reference
-        # interpretation of the bracketed text (SPEC: [foo](not a link)
-        # with a [foo] definition is a link followed by literal text).
-    if after < len(bytes) and bytes[after] == 0x5B:
-        var label_end = _find_bracket_close(s, after + 1)
-        if label_end == -1:
-            return (False, String(), open_bracket)
-        var label = _sub(s, after + 1, label_end)
-        if label == "":
-            label = text_src.copy()
-        var idx = ctx.refs.lookup(label)
-        if idx == -1:
-            return (False, String(), open_bracket)
-        var text_html = render_inline(text_src, ctx) if not image else _plain_text(render_inline(text_src, ctx))
-        return (
-            True,
-            _link_html(ctx.refs.defs[idx].dest, ctx.refs.defs[idx].title, text_html, image),
-            label_end + 1,
+    var n = len(bytes)
+    var i = start + 1
+    if i < n and bytes[i] == 0x2F:
+        # Closing tag: </name whitespace* >
+        i += 1
+        if i >= n or not _is_alpha(bytes[i]):
+            return -1
+        while i < n and (_is_alpha(bytes[i]) or _is_digit(bytes[i]) or bytes[i] == 0x2D):
+            i += 1
+        while i < n and _is_space(bytes[i]):
+            i += 1
+        if i < n and bytes[i] == 0x3E:
+            return i + 1
+        return -1
+    if i >= n or not _is_alpha(bytes[i]):
+        return -1
+    while i < n and (_is_alpha(bytes[i]) or _is_digit(bytes[i]) or bytes[i] == 0x2D):
+        i += 1
+    while True:
+        # Between the tag name / an attribute and the next: whitespace.
+        var j = i
+        while j < n and _is_space(bytes[j]):
+            j += 1
+        if j >= n:
+            return -1
+        if bytes[j] == 0x3E:
+            return j + 1
+        if bytes[j] == 0x2F and j + 1 < n and bytes[j + 1] == 0x3E:
+            return j + 2
+        if j == i:
+            return -1  # attributes must be whitespace-separated
+        i = j
+        # Attribute name.
+        if not (_is_alpha(bytes[i]) or bytes[i] == 0x5F or bytes[i] == 0x3A):
+            return -1
+        i += 1
+        while i < n and (
+            _is_alpha(bytes[i])
+            or _is_digit(bytes[i])
+            or bytes[i] == 0x5F
+            or bytes[i] == 0x2E
+            or bytes[i] == 0x3A
+            or bytes[i] == 0x2D
+        ):
+            i += 1
+        # Optional = value.
+        var k = i
+        while k < n and _is_space(bytes[k]):
+            k += 1
+        if k < n and bytes[k] == 0x3D:
+            k += 1
+            while k < n and _is_space(bytes[k]):
+                k += 1
+            if k >= n:
+                return -1
+            if bytes[k] == 0x22 or bytes[k] == 0x27:
+                var q = bytes[k]
+                k += 1
+                while k < n and bytes[k] != q:
+                    k += 1
+                if k >= n:
+                    return -1
+                i = k + 1
+            else:
+                var v = k
+                while v < n and not _is_space(bytes[v]):
+                    var vb = bytes[v]
+                    if vb == 0x22 or vb == 0x27 or vb == 0x3D or vb == 0x3C or vb == 0x3E or vb == 0x60:
+                        return -1
+                    v += 1
+                if v == k:
+                    return -1
+                i = v
+
+
+def _scan_autolink(s: String, start: Int) -> Tuple[Int, String, Bool]:
+    """Match an autolink at the '<' at `start`: <scheme:...> or an
+    email address. Returns (end index, destination, is_email), with
+    end == -1 when there is no autolink here."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var i = start + 1
+    # URI autolink: scheme is 2-32 chars, letter first.
+    var j = i
+    if j < n and _is_alpha(bytes[j]):
+        j += 1
+        while j < n and (
+            _is_alpha(bytes[j])
+            or _is_digit(bytes[j])
+            or bytes[j] == 0x2B
+            or bytes[j] == 0x2E
+            or bytes[j] == 0x2D
+        ):
+            j += 1
+        if 2 <= j - i and j - i <= 32 and j < n and bytes[j] == 0x3A:
+            var k = j + 1
+            var ok = True
+            while k < n and bytes[k] != 0x3E:
+                var b = bytes[k]
+                if b <= UInt8(0x20) or b == 0x3C:
+                    ok = False
+                    break
+                k += 1
+            if ok and k < n:
+                return (k + 1, _sub(s, i, k), False)
+    # Email autolink.
+    var at = -1
+    var k2 = i
+    while k2 < n and bytes[k2] != 0x3E:
+        var b = bytes[k2]
+        if b == 0x40:
+            if at != -1:
+                return (-1, String(), False)
+            at = k2
+        if b <= UInt8(0x20) or b == 0x3C:
+            return (-1, String(), False)
+        k2 += 1
+    if k2 >= n or at <= i:
+        return (-1, String(), False)
+    var local = _sub(s, i, at)
+    var domain = _sub(s, at + 1, k2)
+    for b in local.as_bytes():
+        var okc = (
+            _is_alpha(b)
+            or _is_digit(b)
+            or b == 0x2E or b == 0x21 or b == 0x23 or b == 0x24 or b == 0x25
+            or b == 0x26 or b == 0x27 or b == 0x2A or b == 0x2B or b == 0x2D
+            or b == 0x2F or b == 0x3D or b == 0x3F or b == 0x5E or b == 0x5F
+            or b == 0x60 or b == 0x7B or b == 0x7C or b == 0x7D or b == 0x7E
         )
-    # Shortcut reference.
-    var idx2 = ctx.refs.lookup(text_src)
-    if idx2 == -1:
-        return (False, String(), open_bracket)
-    var text_html2 = render_inline(text_src, ctx) if not image else _plain_text(render_inline(text_src, ctx))
-    return (
-        True,
-        _link_html(ctx.refs.defs[idx2].dest, ctx.refs.defs[idx2].title, text_html2, image),
-        after,
-    )
+        if not okc:
+            return (-1, String(), False)
+    var labels = domain.split(".")
+    if len(labels) < 2:
+        return (-1, String(), False)
+    for ref lab in labels:
+        var lb = lab.as_bytes()
+        if len(lb) == 0 or lb[0] == 0x2D or lb[len(lb) - 1] == 0x2D:
+            return (-1, String(), False)
+        for b in lb:
+            if not (_is_alpha(b) or _is_digit(b) or b == 0x2D):
+                return (-1, String(), False)
+    return (k2 + 1, _sub(s, i, k2), True)
+
+
+def _decode_cp(s: String, pos: Int) -> Tuple[Int, Int]:
+    """Decode the UTF-8 codepoint starting at byte `pos`.
+    Returns (codepoint, byte length); invalid bytes decode as their
+    own value with length 1."""
+    var bytes = s.as_bytes()
+    var b0 = bytes[pos]
+    if b0 < 0x80:
+        return (Int(b0), 1)
+    var need = 0
+    var cp = 0
+    if b0 >= 0xF0:
+        need = 3
+        cp = Int(b0 & 0x07)
+    elif b0 >= 0xE0:
+        need = 2
+        cp = Int(b0 & 0x0F)
+    elif b0 >= 0xC0:
+        need = 1
+        cp = Int(b0 & 0x1F)
+    else:
+        return (Int(b0), 1)
+    if pos + need >= len(bytes):
+        return (Int(b0), 1)
+    for k in range(1, need + 1):
+        var bx = bytes[pos + k]
+        if bx < 0x80 or bx >= 0xC0:
+            return (Int(b0), 1)
+        cp = (cp << 6) | Int(bx & 0x3F)
+    return (cp, need + 1)
+
+
+def _cp_before(s: String, pos: Int) -> Int:
+    """The codepoint ending just before byte `pos`, or -1 at the
+    start of the string."""
+    if pos <= 0:
+        return -1
+    var bytes = s.as_bytes()
+    var i = pos - 1
+    var steps = 0
+    while i > 0 and bytes[i] >= 0x80 and bytes[i] < 0xC0 and steps < 3:
+        i -= 1
+        steps += 1
+    return _decode_cp(s, i)[0]
+
+
+def _cp_is_space(cp: Int) -> Bool:
+    """The Unicode White_Space property (the spec's whitespace for
+    flanking and label matching)."""
+    if cp == 0x09 or cp == 0x0A or cp == 0x0B or cp == 0x0C or cp == 0x0D or cp == 0x20:
+        return True
+    if cp == 0xA0 or cp == 0x1680 or cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000:
+        return True
+    return 0x2000 <= cp and cp <= 0x200A
+
+
+def _cp_is_punct(cp: Int) -> Bool:
+    """Unicode general categories P and S — the set the reference
+    implementations use for flanking (it is what makes a run after
+    £ or € unable to close emphasis, per the corpus)."""
+    if cp < 0x80:
+        return _is_punct(UInt8(cp))
+    if 0xA1 <= cp and cp <= 0xBF:
+        # Exceptions in this range are letters, numbers, and marks.
+        return not (
+            cp == 0xAA or cp == 0xAD or cp == 0xB2 or cp == 0xB3 or cp == 0xB5
+            or cp == 0xB9 or cp == 0xBA or cp == 0xBC or cp == 0xBD or cp == 0xBE
+        )
+    if 0x2010 <= cp and cp <= 0x2027:
+        return True
+    if 0x2030 <= cp and cp <= 0x205E:
+        return True
+    if 0x207A <= cp and cp <= 0x207D or 0x208A <= cp and cp <= 0x208D:
+        return True
+    if 0x20A0 <= cp and cp <= 0x20BF:
+        return True  # currency symbols (Sc), incl. the euro sign
+    if 0x2190 <= cp and cp <= 0x21FF:
+        return True  # arrows (Sm/So)
+    if 0x2200 <= cp and cp <= 0x22FF:
+        return True  # mathematical operators (Sm)
+    if 0x2300 <= cp and cp <= 0x23FF:
+        return True  # technical symbols (So/Sk)
+    if 0x2500 <= cp and cp <= 0x2BFF:
+        return True  # shapes, dingbats (So-heavy)
+    if 0x3001 <= cp and cp <= 0x303F:
+        return True  # CJK punctuation
+    if 0xFE30 <= cp and cp <= 0xFE6F:
+        return True
+    if 0xFF01 <= cp and cp <= 0xFF0F or 0xFF1A <= cp and cp <= 0xFF20:
+        return True
+    if 0xFF3B <= cp and cp <= 0xFF40 or 0xFF5B <= cp and cp <= 0xFF65:
+        return True
+    if 0x1F300 <= cp and cp <= 0x1FAFF:
+        return True  # pictographs (So)
+    return False
 
 
 def _flanking(s: String, pos: Int, run: Int, ch: UInt8) -> Tuple[Bool, Bool]:
-    """(can_open, can_close) for a delimiter run at `pos` of length `run`."""
-    var bytes = s.as_bytes()
-    var before: Int = 256  # whitespace class sentinel = beginning
-    if pos > 0:
-        before = Int(bytes[pos - 1])
-    var after_pos = pos + run
-    var after: Int = 256
-    if after_pos < len(bytes):
-        after = Int(bytes[after_pos])
-    var before_ws = before == 256 or _is_space(UInt8(before)) or before < 0x20
-    var after_ws = after == 256 or _is_space(UInt8(after)) or after < 0x20
-    if pos >= 2 and bytes[pos - 2] == 0xC2 and bytes[pos - 1] == 0xA0:
-        before_ws = True
-    if after_pos + 1 < len(bytes) and bytes[after_pos] == 0xC2 and bytes[after_pos + 1] == 0xA0:
-        after_ws = True
-    var before_punct = before != 256 and _is_punct(UInt8(before))
-    var after_punct = after != 256 and _is_punct(UInt8(after))
+    """(can_open, can_close) for a delimiter run at `pos` of length
+    `run`, per the spec's left-/right-flanking definitions over
+    Unicode whitespace and punctuation."""
+    var before = _cp_before(s, pos)
+    var after = -1
+    if pos + run < s.byte_length():
+        after = _decode_cp(s, pos + run)[0]
+    var before_ws = before == -1 or _cp_is_space(before)
+    var after_ws = after == -1 or _cp_is_space(after)
+    var before_punct = before != -1 and _cp_is_punct(before)
+    var after_punct = after != -1 and _cp_is_punct(after)
     var left_flanking = not after_ws and (not after_punct or before_ws or before_punct)
     var right_flanking = not before_ws and (not before_punct or after_ws or after_punct)
     if ch == 0x5F:  # underscore: intraword emphasis is not emphasis
@@ -1598,152 +1852,348 @@ def _flanking(s: String, pos: Int, run: Int, ch: UInt8) -> Tuple[Bool, Bool]:
     return (left_flanking, right_flanking)
 
 
-def _edge_ws(content: String) -> Bool:
-    """True when the content begins or ends with whitespace (space, tab,
-    newline, or a non-breaking space) — such a span cannot be emphasis."""
-    var cb = content.as_bytes()
-    if len(cb) == 0:
-        return True
-    if cb[0] == 0x20 or cb[0] == 0x09 or cb[0] == 0x0A:
-        return True
-    var last = cb[len(cb) - 1]
-    if last == 0x20 or last == 0x09 or last == 0x0A:
-        return True
-    if len(cb) >= 2 and cb[0] == 0xC2 and cb[1] == 0xA0:
-        return True
-    if len(cb) >= 2 and cb[len(cb) - 2] == 0xC2 and cb[len(cb) - 1] == 0xA0:
-        return True
+# ---------- inline node model ----------
+#
+# Inline parsing builds a list of nodes: finished HTML text and
+# delimiter runs. Emphasis is resolved afterwards by the spec's
+# delimiter-stack algorithm (_process_emphasis), and links splice
+# their bracketed range into a single finished node — the same
+# architecture as the reference implementations.
+
+
+struct InNode(Copyable, Movable):
+    var delim: Bool
+    var html: String
+    var ch: UInt8
+    var num: Int
+    var can_open: Bool
+    var can_close: Bool
+
+    def __init__(out self, html: String):
+        self.delim = False
+        self.html = html.copy()
+        self.ch = 0
+        self.num = 0
+        self.can_open = False
+        self.can_close = False
+
+    @staticmethod
+    def delimiter(ch: UInt8, num: Int, can_open: Bool, can_close: Bool) -> InNode:
+        var node = InNode(String())
+        node.delim = True
+        node.ch = ch
+        node.num = num
+        node.can_open = can_open
+        node.can_close = can_close
+        return node^
+
+
+def _render_nodes(nodes: List[InNode], lo: Int, hi: Int) -> String:
+    var out = String()
+    for i in range(lo, hi):
+        if nodes[i].delim:
+            for _ in range(nodes[i].num):
+                out += String(StringSlice(unsafe_from_utf8=Span([nodes[i].ch])))
+        else:
+            out += nodes[i].html
+    return out^
+
+
+def _odd_match(opener: InNode, closer: InNode) -> Bool:
+    """The rule of three: if both runs can open and close, they may
+    not match when the sum of their lengths is a multiple of 3 unless
+    both lengths are."""
+    if opener.can_close or closer.can_open:
+        if (opener.num + closer.num) % 3 == 0:
+            return not (opener.num % 3 == 0 and closer.num % 3 == 0)
     return False
 
 
-def _try_emphasis(
-    s: String, pos: Int, mut ctx: Ctx
-) -> Tuple[Bool, String, Int]:
-    """Attempt emphasis/strong at the run at `pos`. Greedy on ** before *:
-    looks for the nearest valid closing run; content is rendered
-    recursively. This is the documented approximation of the delimiter
-    algorithm — the corpus count is its measure."""
+def _next_closer(nodes: List[InNode], bottom: Int, after: Int) -> Int:
+    var i = after + 1
+    if i < bottom + 1:
+        i = bottom + 1
+    while i < len(nodes):
+        if nodes[i].delim and nodes[i].can_close and nodes[i].num > 0:
+            return i
+        i += 1
+    return -1
+
+
+def _process_emphasis(mut nodes: List[InNode], bottom: Int):
+    """Match emphasis delimiters above `bottom` (a node index; -1 for
+    the whole list). Matched ranges are spliced into single em/strong
+    text nodes; every delimiter above the bottom leaves the stack when
+    this returns, matched or not."""
+    var closer = _next_closer(nodes, bottom, bottom)
+    while closer != -1:
+        var ch = nodes[closer].ch
+        var opener = -1
+        var j = closer - 1
+        while j > bottom:
+            if (
+                nodes[j].delim
+                and nodes[j].ch == ch
+                and nodes[j].can_open
+                and nodes[j].num > 0
+                and not _odd_match(nodes[j], nodes[closer])
+            ):
+                opener = j
+                break
+            j -= 1
+        if opener == -1:
+            if not nodes[closer].can_open:
+                var lit = String()
+                for _ in range(nodes[closer].num):
+                    lit += String(StringSlice(unsafe_from_utf8=Span([ch])))
+                nodes[closer] = InNode(lit^)
+            closer = _next_closer(nodes, bottom, closer)
+            continue
+        var use = 2 if nodes[opener].num >= 2 and nodes[closer].num >= 2 else 1
+        var tag = String("strong") if use == 2 else String("em")
+        var inner = _render_nodes(nodes, opener + 1, closer)
+        nodes[opener].num -= use
+        nodes[closer].num -= use
+        var wrapped = "<" + tag + ">" + inner + "</" + tag + ">"
+        # Splice: drop the nodes between opener and closer, insert the
+        # wrapped node in their place. The closer shifts to opener + 2.
+        var kept = List[InNode]()
+        for i in range(0, opener + 1):
+            kept.append(nodes[i].copy())
+        kept.append(InNode(wrapped^))
+        for i in range(closer, len(nodes)):
+            kept.append(nodes[i].copy())
+        nodes = kept^
+        closer = opener + 2
+        if nodes[closer].num == 0:
+            closer = _next_closer(nodes, bottom, closer)
+    # All delimiters above the bottom leave the stack as literal text.
+    for i in range(bottom + 1, len(nodes)):
+        if nodes[i].delim:
+            var lit = String()
+            for _ in range(nodes[i].num):
+                lit += String(StringSlice(unsafe_from_utf8=Span([nodes[i].ch])))
+            nodes[i] = InNode(lit^)
+
+
+def _scan_html_comment(s: String, start: Int) -> Int:
+    """Match an HTML comment at the '<' at `start` per the spec's
+    grammar: <!--, text that does not start with > or -> and contains
+    no dash followed by ->, then -->. Returns the index just past
+    the closing -->, or -1."""
     var bytes = s.as_bytes()
-    var ch = bytes[pos]
-    var run = 0
-    while pos + run < len(bytes) and bytes[pos + run] == ch:
-        run += 1
-    var fl = _flanking(s, pos, run, ch)
-    if not fl[0]:
-        return (False, String(), pos)
-    var use = 2 if run >= 2 else 1
-    while use >= 1:
-        var search = pos + run
-        while search < len(bytes):
-            var sb = bytes[search]
-            if sb == 0x5C and search + 1 < len(bytes):
-                search += 2
-                continue
-            if sb == 0x60:
-                var crun = 1
-                var cj = search + 1
-                while cj < len(bytes) and bytes[cj] == 0x60:
-                    crun += 1
-                    cj += 1
-                var cclose = _find_backtick_close(s, cj, crun)
-                search = cclose + crun if cclose != -1 else cj
-                continue
-            if sb == 0x3C:
-                var gt = s.find(">", search)
-                if gt != -1:
-                    search = gt + 1
-                    continue
-            if sb == ch:
-                var r2 = 0
-                while search + r2 < len(bytes) and bytes[search + r2] == ch:
-                    r2 += 1
-                if r2 >= use:
-                    var fl2 = _flanking(s, search, use, ch)
-                    if fl2[1]:
-                        var content = _sub(s, pos + run, search)
-                        if content != "" and not _edge_ws(content):
-                            var tag = "strong" if use == 2 else "em"
-                            var inner = render_inline(content, ctx)
-                            var html = "<" + tag + ">" + inner + "</" + tag + ">"
-                            # Leftover opener delimiters render literally.
-                            var prefix = String()
-                            for _ in range(run - use):
-                                prefix += String(
-                                    StringSlice(
-                                        unsafe_from_utf8=bytes[pos : pos + 1]
-                                    )
-                                )
-                            return (True, prefix + html, search + use)
-                search += r2
-                continue
-            search += 1
-        use -= 1
-    return (False, String(), pos)
+    var n = len(bytes)
+    var i = start + 4
+    if i >= n or bytes[i] == 0x3E or s.startswith("->", i):
+        return -1
+    while i < n:
+        if bytes[i] == 0x2D and s.startswith("->", i + 1):
+            return i + 3
+        i += 1
+    return -1
 
 
-def _looks_like_email(s: String) -> Bool:
-    var at = s.find("@")
-    if at <= 0 or s.find("@", at + 1) != -1:
-        return False
-    var domain = _sub(s, at + 1, s.byte_length())
-    if domain.find(".") == -1:
-        return False
-    for b in s.as_bytes():
-        var ok = (
-            (UInt8(0x41) <= b and b <= UInt8(0x5A))
-            or (UInt8(0x61) <= b and b <= UInt8(0x7A))
-            or (UInt8(0x30) <= b and b <= UInt8(0x39))
-            or b == 0x40 or b == 0x2E or b == 0x2D or b == 0x5F or b == 0x2B
-            or b == 0x21 or b == 0x23 or b == 0x24 or b == 0x25 or b == 0x26
-            or b == 0x27 or b == 0x2A or b == 0x2F or b == 0x3D or b == 0x3F
-            or b == 0x5E or b == 0x60 or b == 0x7B or b == 0x7C or b == 0x7D
-            or b == 0x7E
-        )
-        if not ok:
-            return False
-    return True
+def _flush_inline(mut text: String, mut nodes: List[InNode]):
+    """Append the pending literal-text buffer to the node list,
+    HTML-escaped, and reset it."""
+    if text.byte_length() > 0:
+        nodes.append(InNode(escape_text(text)))
+        text = String()
+
+
+struct Bracket(Copyable, Movable):
+    var node_idx: Int  # index of the '[' text node in the node list
+    var src_pos: Int  # byte index of '[' in the source (of '!' for images)
+    var image: Bool
+    var active: Bool
+
+    def __init__(out self, node_idx: Int, src_pos: Int, image: Bool):
+        self.node_idx = node_idx
+        self.src_pos = src_pos
+        self.image = image
+        self.active = True
+
+
+def _scan_link_label(s: String, start: Int) -> Int:
+    """Scan a link label starting just after its '[': returns the
+    index of the ']' that closes it (balanced unescaped brackets and
+    code spans are skipped), or -1. Labels are at most 999 chars."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var depth = 0
+    var i = start
+    while i < n and i - start <= 999:
+        var b = bytes[i]
+        if b == 0x5C and i + 1 < n and _is_punct(bytes[i + 1]):
+            i += 2
+            continue
+        if b == 0x60:
+            var run = 1
+            var j = i + 1
+            while j < n and bytes[j] == 0x60:
+                run += 1
+                j += 1
+            var close = _find_backtick_close(s, j, run)
+            i = close + run if close != -1 else j
+            continue
+        if b == 0x5B:
+            depth += 1
+        elif b == 0x5D:
+            if depth == 0:
+                return i
+            depth -= 1
+        i += 1
+    return -1
+
+
+def _scan_entity(s: String, start: Int) -> Tuple[Int, String]:
+    """Match a character reference at the '&' at `start`.
+    Returns (index just past ';', decoded text), or (-1, "")."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var i = start + 1
+    if i < n and bytes[i] == 0x23:
+        var j = i + 1
+        var hex_mode = False
+        if j < n and (bytes[j] == 0x78 or bytes[j] == 0x58):
+            hex_mode = True
+            j += 1
+        var digits_start = j
+        var cp = 0
+        while j < n and bytes[j] != 0x3B:
+            var d = bytes[j]
+            if hex_mode:
+                if _is_digit(d):
+                    cp = cp * 16 + Int(d - 0x30)
+                elif UInt8(0x61) <= d and d <= UInt8(0x66):
+                    cp = cp * 16 + Int(d - 0x61) + 10
+                elif UInt8(0x41) <= d and d <= UInt8(0x46):
+                    cp = cp * 16 + Int(d - 0x41) + 10
+                else:
+                    return (-1, String())
+            else:
+                if _is_digit(d):
+                    cp = cp * 10 + Int(d - 0x30)
+                else:
+                    return (-1, String())
+            j += 1
+            if j - digits_start > 8 or cp > 0x10FFFF:
+                return (-1, String())
+        if j >= n or j == digits_start:
+            return (-1, String())
+        return (j + 1, _decode_codepoint(cp))
+    var j = i
+    while j < n and (_is_alpha(bytes[j]) or _is_digit(bytes[j])) and j - i < 32:
+        j += 1
+    if j < n and bytes[j] == 0x3B and j > i:
+        var val = _entity_value(_sub(s, i, j))
+        if val != "":
+            return (j + 1, val)
+    return (-1, String())
+
+
+def _close_bracket(
+    s: String,
+    close_pos: Int,
+    mut nodes: List[InNode],
+    mut brackets: List[Bracket],
+    mut ctx: Ctx,
+) -> Int:
+    """Handle the ']' at `close_pos` against the innermost bracket.
+    On success the bracketed range becomes one link/image node and
+    the index just past the whole construct is returned; on failure
+    -1 (the ']' is literal text and the bracket is spent)."""
+    if len(brackets) == 0:
+        return -1
+    var b = brackets.pop()
+    if not b.active:
+        return -1
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var after = close_pos + 1
+    var formed = False
+    var dest = String()
+    var title = String()
+    var end = after
+    if after < n and bytes[after] == 0x28:
+        var parsed = _parse_link_dest_title(s, after)
+        if parsed[0]:
+            dest = parsed[1].copy()
+            title = parsed[2].copy()
+            end = parsed[3]
+            formed = True
+    var label_given = False
+    if not formed and after < n and bytes[after] == 0x5B:
+        var lend = _scan_link_label(s, after + 1)
+        if lend != -1:
+            label_given = True
+            var lab = _sub(s, after + 1, lend)
+            if lab == "":
+                lab = _sub(s, b.src_pos + (2 if b.image else 1), close_pos)
+            var idx = ctx.refs.lookup(lab)
+            if idx != -1:
+                dest = ctx.refs.defs[idx].dest.copy()
+                title = ctx.refs.defs[idx].title.copy()
+                end = lend + 1
+                formed = True
+    if not formed and not label_given:
+        # Shortcut (or collapsed, handled above): the bracketed text
+        # itself is the label. When the inline parse failed this still
+        # applies — [foo](not a link) with a [foo] definition is a
+        # link followed by literal text.
+        var lab2 = _sub(s, b.src_pos + (2 if b.image else 1), close_pos)
+        var idx2 = ctx.refs.lookup(lab2)
+        if idx2 != -1:
+            dest = ctx.refs.defs[idx2].dest.copy()
+            title = ctx.refs.defs[idx2].title.copy()
+            end = after
+            formed = True
+    if not formed:
+        return -1
+    _process_emphasis(nodes, b.node_idx)
+    var inner = _render_nodes(nodes, b.node_idx + 1, len(nodes))
+    var content = _plain_text(inner) if b.image else inner
+    var html = _link_html(dest, title, content, b.image)
+    var kept = List[InNode]()
+    for k in range(0, b.node_idx):
+        kept.append(nodes[k].copy())
+    kept.append(InNode(html^))
+    nodes = kept^
+    if not b.image:
+        # A formed link deactivates every earlier link bracket.
+        for k in range(len(brackets)):
+            if not brackets[k].image:
+                brackets[k].active = False
+    return end
 
 
 def render_inline(s: String, mut ctx: Ctx) -> String:
     var bytes = s.as_bytes()
     var n = len(bytes)
-    var out = String()
+    var nodes = List[InNode]()
+    var brackets = List[Bracket]()
+    var text = String()  # pending literal text (raw, escaped on flush)
+
     var i = 0
-    var run = -1  # start of the pending plain-text run (-1: none pending)
     while i < n:
         var b = bytes[i]
-        var is_starter = (
-            b == 0x5C or b == 0x60 or b == 0x21 or b == 0x5B or b == 0x3C
-            or b == 0x26 or b == 0x22 or b == 0x7E or b == 0x2A or b == 0x5F
-            or b == 0x20
-        )
-        if not is_starter:
-            if run == -1:
-                run = i
-            i += 1
-            continue
-        if run != -1:
-            out += String(StringSlice(unsafe_from_utf8=bytes[run:i]))
-            run = -1
-        # Backslash escapes and hard breaks.
+        # Backslash escapes and backslash hard breaks.
         if b == 0x5C:
             if i + 1 < n and bytes[i + 1] == 0x0A:
-                out += "<br />\n"
+                _flush_inline(text, nodes)
+                nodes.append(InNode(String("<br />\n")))
                 i += 2
+                continue
+            if i + 1 < n and bytes[i + 1] == 0x0D and i + 2 < n and bytes[i + 2] == 0x0A:
+                _flush_inline(text, nodes)
+                nodes.append(InNode(String("<br />\n")))
+                i += 3
                 continue
             if i + 1 < n and _is_punct(bytes[i + 1]):
-                var c = bytes[i + 1]
-                if c == 0x26:
-                    out += "&amp;"
-                elif c == 0x3C:
-                    out += "&lt;"
-                elif c == 0x3E:
-                    out += "&gt;"
-                else:
-                    out += String(StringSlice(unsafe_from_utf8=bytes[i + 1 : i + 2]))
+                text += String(StringSlice(unsafe_from_utf8=bytes[i + 1 : i + 2]))
                 i += 2
                 continue
-            out += "\\"
+            text += "\\"
             i += 1
             continue
         # Code span.
@@ -1756,7 +2206,7 @@ def render_inline(s: String, mut ctx: Ctx) -> String:
             var close = _find_backtick_close(s, j, run)
             if close == -1:
                 for _ in range(run):
-                    out += "`"
+                    text += "`"
                 i = j
                 continue
             var content = _sub(s, j, close).replace("\n", " ")
@@ -1768,19 +2218,81 @@ def render_inline(s: String, mut ctx: Ctx) -> String:
                 and String(content.strip()) != ""
             ):
                 content = _sub(content, 1, len(cb) - 1)
-            out += "<code>" + escape_text(content) + "</code>"
+            _flush_inline(text, nodes)
+            nodes.append(InNode(String("<code>") + escape_text(content) + "</code>"))
             i = close + run
             continue
-        # Image / link / footnote reference.
-        if b == 0x21 and i + 1 < n and bytes[i + 1] == 0x5B:
-            var link = _try_link(s, i + 1, True, ctx)
-            if link[0]:
-                out += link[1]
-                i = link[2]
+        # Inline HTML, comments and declarations, autolinks.
+        if b == 0x3C:
+            if s.startswith("<!--", i):
+                var end = _scan_html_comment(s, i)
+                if end != -1:
+                    _flush_inline(text, nodes)
+                    nodes.append(InNode(_sub(s, i, end)))
+                    i = end
+                    continue
+            if s.startswith("<?", i):
+                var end2 = s.find("?>", i + 2)
+                if end2 != -1:
+                    _flush_inline(text, nodes)
+                    nodes.append(InNode(_sub(s, i, end2 + 2)))
+                    i = end2 + 2
+                    continue
+            if s.startswith("<![CDATA[", i):
+                var end3 = s.find("]]>", i + 9)
+                if end3 != -1:
+                    _flush_inline(text, nodes)
+                    nodes.append(InNode(_sub(s, i, end3 + 3)))
+                    i = end3 + 3
+                    continue
+            if (
+                i + 2 < n
+                and bytes[i + 1] == 0x21
+                and UInt8(0x41) <= bytes[i + 2]
+                and bytes[i + 2] <= UInt8(0x5A)
+            ):
+                var end4 = s.find(">", i + 2)
+                if end4 != -1:
+                    _flush_inline(text, nodes)
+                    nodes.append(InNode(_sub(s, i, end4 + 1)))
+                    i = end4 + 1
+                    continue
+            var auto = _scan_autolink(s, i)
+            if auto[0] != -1:
+                _flush_inline(text, nodes)
+                if auto[2]:
+                    nodes.append(InNode(_autolink_html(String("mailto:") + auto[1], auto[1])))
+                else:
+                    nodes.append(InNode(_autolink_html(auto[1], auto[1])))
+                i = auto[0]
                 continue
-            out += "!"
+            var tag_end = _scan_tag(s, i)
+            if tag_end != -1:
+                _flush_inline(text, nodes)
+                nodes.append(InNode(_sub(s, i, tag_end)))
+                i = tag_end
+                continue
+            text += "<"
             i += 1
             continue
+        # Entity / numeric character reference.
+        if b == 0x26:
+            var ent = _scan_entity(s, i)
+            if ent[0] != -1:
+                text += ent[1]
+                i = ent[0]
+                continue
+            text += "&"
+            i += 1
+            continue
+        # Image bracket.
+        if b == 0x21 and i + 1 < n and bytes[i + 1] == 0x5B:
+            _flush_inline(text, nodes)
+            nodes.append(InNode(String("![")))
+            brackets.append(Bracket(len(nodes) - 1, i, True))
+            i += 2
+            continue
+        # Link bracket / footnote reference.
         if b == 0x5B:
             if i + 1 < n and bytes[i + 1] == 0x5E:
                 var close = _find_bracket_close(s, i + 2)
@@ -1788,160 +2300,85 @@ def render_inline(s: String, mut ctx: Ctx) -> String:
                     var label = _sub(s, i + 2, close)
                     if ctx.refs.footnote_index(label) >= 0:
                         var num = ctx.refs.footnote_number(label)
-                        out += (
-                            '<sup class="footnote-reference" id="fnref:'
-                            + label
-                            + '"><a href="#fn:'
-                            + label
-                            + '">'
-                            + String(num)
-                            + "</a></sup>"
+                        _flush_inline(text, nodes)
+                        nodes.append(
+                            InNode(
+                                String('<sup class="footnote-reference" id="fnref:')
+                                + label
+                                + '"><a href="#fn:'
+                                + label
+                                + '">'
+                                + String(num)
+                                + "</a></sup>"
+                            )
                         )
                         i = close + 1
                         continue
-                out += "["
-                i += 1
-                continue
-            var link2 = _try_link(s, i, False, ctx)
-            if link2[0]:
-                out += link2[1]
-                i = link2[2]
-                continue
-            out += "["
+            _flush_inline(text, nodes)
+            nodes.append(InNode(String("[")))
+            brackets.append(Bracket(len(nodes) - 1, i, False))
             i += 1
             continue
-        # Inline HTML / autolink.
-        if b == 0x3C:
-            if (
-                i + 3 < n
-                and bytes[i + 1] == 0x21
-                and bytes[i + 2] == 0x2D
-                and bytes[i + 3] == 0x2D
-            ):
-                var end = s.find("-->", i + 4)
+        # Close bracket.
+        if b == 0x5D:
+            if len(brackets) > 0:
+                _flush_inline(text, nodes)
+                var end = _close_bracket(s, i, nodes, brackets, ctx)
                 if end != -1:
-                    out += _sub(s, i, end + 3)
-                    i = end + 3
+                    i = end
                     continue
-            var j = i + 1
-            if j < n and bytes[j] == 0x2F:
+            text += "]"
+            i += 1
+            continue
+        # Emphasis delimiter run.
+        if b == 0x2A or b == 0x5F:
+            var run = 0
+            var j = i
+            while j < n and bytes[j] == b:
+                run += 1
                 j += 1
-            if j < n and _is_alpha(bytes[j]):
-                var k = j
-                while k < n and bytes[k] != 0x3E:
-                    k += 1
-                if k < n:
-                    var tag = _sub(s, i, k + 1)
-                    var inner = _sub(tag, 1, tag.byte_length() - 1)
-                    if _looks_like_email(inner):
-                        out += '<a href="mailto:' + escape_attr(inner) + '">' + escape_text(inner) + "</a>"
-                        i = k + 1
-                        continue
-                    var colon = tag.find(":")
-                    var space = tag.find(" ")
-                    if colon != -1 and (space == -1 or colon < space) and tag.find("=") == -1 and bytes[i + 1] != 0x2F:
-                        # Autolink <scheme:...>.
-                        var dest = _sub(tag, 1, tag.byte_length() - 1)
-                        out += _link_html(dest, String(), escape_text(dest), False)
-                    else:
-                        out += tag
-                    i = k + 1
-                    continue
-            out += "&lt;"
-            i += 1
+            var fl = _flanking(s, i, run, b)
+            _flush_inline(text, nodes)
+            nodes.append(InNode.delimiter(b, run, fl[0], fl[1]))
+            i = j
             continue
-        # Entity.
-        if b == 0x26:
-            var j = i + 1
-            if j < n and bytes[j] == 0x23:
-                var k = j + 1
-                var cp = 0
-                var valid = True
-                var hex_mode = False
-                if k < n and (bytes[k] == 0x78 or bytes[k] == 0x58):
-                    hex_mode = True
-                    k += 1
-                var digits_start = k
-                while k < n and bytes[k] != 0x3B and k - digits_start <= 8:
-                    var d = bytes[k]
-                    if hex_mode:
-                        if _is_digit(d):
-                            cp = cp * 16 + Int(d - 0x30)
-                        elif UInt8(0x61) <= d and d <= UInt8(0x66):
-                            cp = cp * 16 + Int(d - 0x61) + 10
-                        elif UInt8(0x41) <= d and d <= UInt8(0x46):
-                            cp = cp * 16 + Int(d - 0x41) + 10
-                        else:
-                            valid = False
-                            break
-                    else:
-                        if _is_digit(d):
-                            cp = cp * 10 + Int(d - 0x30)
-                        else:
-                            valid = False
-                            break
-                    k += 1
-                if valid and k < n and bytes[k] == 0x3B and k > digits_start:
-                    out += escape_text(_decode_codepoint(cp))
-                    i = k + 1
-                    continue
-                out += "&amp;"
-                i += 1
-                continue
-            var k2 = j
-            while k2 < n and (_is_alpha(bytes[k2]) or _is_digit(bytes[k2])) and k2 - j < 32:
-                k2 += 1
-            if k2 < n and bytes[k2] == 0x3B and k2 > j:
-                var name = _sub(s, j, k2)
-                var val = _entity_value(name)
-                if val != "":
-                    out += escape_text(val)
-                    i = k2 + 1
-                    continue
-            out += "&amp;"
-            i += 1
-            continue
-        if b == 0x22:
-            out += "&quot;"
-            i += 1
-            continue
-        # Strikethrough.
+        # Strikethrough (extension): a naive nearest-close match, as
+        # before — it is not part of the CommonMark grammar.
         if b == 0x7E and i + 1 < n and bytes[i + 1] == 0x7E:
             var close = s.find("~~", i + 2)
             if close != -1 and close > i + 2:
                 var content = _sub(s, i + 2, close)
                 if not content.startswith(" ") and not content.endswith(" "):
-                    out += "<del>" + render_inline(content, ctx) + "</del>"
+                    _flush_inline(text, nodes)
+                    nodes.append(
+                        InNode(String("<del>") + render_inline(content, ctx) + "</del>")
+                    )
                     i = close + 2
                     continue
-            out += "~"
+            text += "~"
             i += 1
             continue
-        # Emphasis.
-        if b == 0x2A or b == 0x5F:
-            var em = _try_emphasis(s, i, ctx)
-            if em[0]:
-                out += em[1]
-                i = em[2]
-                continue
-            out += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
-            i += 1
-            continue
-        # Hard break: two or more spaces before a newline.
+        # Hard break: two or more spaces before a line ending.
         if b == 0x20:
             var j = i
             while j < n and bytes[j] == 0x20:
                 j += 1
             if j < n and bytes[j] == 0x0A and j - i >= 2:
-                out += "<br />\n"
+                _flush_inline(text, nodes)
+                nodes.append(InNode(String("<br />\n")))
                 i = j + 1
                 continue
-            out += _sub(s, i, j)
+            if j + 1 < n and bytes[j] == 0x0D and bytes[j + 1] == 0x0A and j - i >= 2:
+                _flush_inline(text, nodes)
+                nodes.append(InNode(String("<br />\n")))
+                i = j + 2
+                continue
+            text += _sub(s, i, j)
             i = j
             continue
-        # A starter byte no branch claimed (e.g. a lone '!'): literal.
-        out += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
+        # Ordinary text.
+        text += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
         i += 1
-    if run != -1:
-        out += String(StringSlice(unsafe_from_utf8=bytes[run:n]))
-    return out^
+    _flush_inline(text, nodes)
+    _process_emphasis(nodes, -1)
+    return _render_nodes(nodes, 0, len(nodes))
