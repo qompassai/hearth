@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Hearth: A Tiger Style Mojo Static Site Generator"
+authors:
+  - family-names: Porter
+    given-names: Matthew A.
+    orcid: "https://orcid.org/0000-0002-0302-4812"
+    affiliation: "Qompass AI"
+version: "v2026-10-17"
+date-released: 2026-10-17
+license: Apache-2.0
+repository-code: "https://github.com/qompassai/hearth"
+keywords:
+  - Mojo
+  - static site generator
+  - Tiger Style
+  - deterministic builds
+  - Markdown
+  - templates
+abstract: "Hearth is a Tiger Style static site generator written in Mojo: a single native binary that turns Markdown and templates into a static site, with deterministic output, bounded work, and zero runtime dependencies — no Node, no npm. Compatibility is defined at the output level against a frozen corpus (the CommonMark 0.31.2 suite, a real publication page, and a deterministic 1,000-page bench site) with Zola 0.22.1 as the pinned reference implementation. Hearth is the reference implementation for the estate's Tiger Style Mojo guide. This release is Phase 0: the governing spec, the frozen corpus, and the pinned Mojo 1.1.0 toolchain; the generator itself is Phase 1."
