@@ -392,7 +392,9 @@ def _content_after(
             else:
                 for _ in range(col + width - target_col):
                     out += " "
-                col = target_col
+                # The walk continues at the tab's TRUE end column, so
+                # later tabs in the run expand at their true width.
+                col = col + width
                 i += 1
                 break
         else:
@@ -571,7 +573,7 @@ def _decode_entities(s: String) -> String:
                                 cp = cp * 10 + Int(db - 0x30)
                             else:
                                 ok = False
-                    if ok:
+                    if ok and cp <= 0x10FFFF:
                         out += _decode_codepoint(cp)
                         i = semi + 1
                         continue
@@ -913,7 +915,7 @@ def _collect_refs(
             while p2 < len(bytes) and bytes[p2] == bytes[pos]:
                 run += 1
                 p2 += 1
-            if run >= 3:
+            if run >= 3 and indent < 4:
                 if not in_fence:
                     in_fence = True
                     fence_char = bytes[pos]
@@ -1022,7 +1024,7 @@ def _atx_heading(line: String) -> Tuple[Bool, Int, String]:
     var bytes = line.as_bytes()
     var n = len(bytes)
     var i = 0
-    while i < n and bytes[i] == 0x20 and i < 4:
+    while i < n and bytes[i] == 0x20 and i < 3:
         i += 1
     if i >= 4 and n > 0:
         return (False, 0, String())
@@ -1052,7 +1054,7 @@ def _fence_start(line: String) -> Tuple[Bool, UInt8, Int, String]:
     var bytes = line.as_bytes()
     var n = len(bytes)
     var i = 0
-    while i < n and bytes[i] == 0x20 and i < 4:
+    while i < n and bytes[i] == 0x20 and i < 3:
         i += 1
     if i >= n:
         return (False, UInt8(0), 0, String())
@@ -1380,7 +1382,9 @@ def _block_starts(line: String, consumed: Bool) -> Bool:
     var ht = _html_block_type(line)
     if 1 <= ht and ht <= 6:
         return True
-    if _list_marker(line).ok:
+    var bm = _list_marker(line)
+    if bm.ok and not bm.blank:
+        # An empty item cannot interrupt a paragraph.
         return True
     var i = _first_nonspace(line)
     return i < line.byte_length() and line.as_bytes()[i] == 0x3E
@@ -1504,6 +1508,24 @@ def _render_table(
     return (out^, j)
 
 
+def _leaf_is_paragraph(line: String) -> Bool:
+    """Whether `line`, as a frame's newest line, leaves a paragraph
+    as the open leaf block — so a following line may continue it
+    lazily. Blank lines and every block start close the paragraph."""
+    if _is_blank(line) or _leading_spaces(line) >= 4:
+        return False
+    if _fence_start(line)[0] or _atx_heading(line)[0]:
+        return False
+    if _is_thematic_break(line) or _html_block_type(line) > 0:
+        return False
+    if _list_marker(line).ok:
+        return False
+    var p = _first_nonspace(line)
+    if p < line.byte_length() and line.as_bytes()[p] == 0x3E:
+        return False
+    return True
+
+
 def _render_list(
     lines: List[String],
     start: Int,
@@ -1521,6 +1543,14 @@ def _render_list(
         if consumed[j]:
             break
         var line = lines[j]
+        # A thematic break at the list's own level ends the list
+        # (it takes precedence over reading the line as an item).
+        if (
+            j > start
+            and _is_thematic_break(line)
+            and _leading_spaces(line) < content_col
+        ):
+            break
         var m = _list_marker(line)
         var same_list = (
             m.ok
@@ -1577,14 +1607,19 @@ def _render_list(
             no_consume.append(False)
         var inner = render_blocks(item, 0, len(item), no_consume, ctx, depth + 1)
         no_consume.clear()
-        if not loose:
-            # Tight list: a single-paragraph item renders without <p>.
-            if inner.startswith("<p>") and inner.endswith("</p>\n") and inner.find("<p>", 3) == -1:
-                inner = _sub(inner, 3, inner.byte_length() - 5) + "\n"
-        if inner.startswith("<p>"):
-            out += "<li>\n" + inner + "</li>\n"
+        var single_para = (
+            inner.startswith("<p>")
+            and inner.endswith("</p>\n")
+            and inner.find("<p>", 3) == -1
+        )
+        if inner == "":
+            out += "<li></li>\n"
+        elif not loose and single_para:
+            # Tight single-paragraph item: bare inline content, no
+            # trailing newline inside the item.
+            out += "<li>" + _sub(inner, 3, inner.byte_length() - 5) + "</li>\n"
         else:
-            out += "<li>" + inner + "</li>\n"
+            out += "<li>\n" + inner + "</li>\n"
     out += "</ol>\n" if first.ordered else "</ul>\n"
     return (out^, j)
 
@@ -1595,9 +1630,18 @@ def _plain_text(html: String) -> String:
     var i = 0
     while i < len(bytes):
         if bytes[i] == 0x3C:
+            var tag_start = i
             while i < len(bytes) and bytes[i] != 0x3E:
                 i += 1
             i += 1
+            # An image contributes its alt text (attribute-escaped in
+            # the markup; the final replace pass unescapes it).
+            if html.startswith("<img", tag_start):
+                var alt_at = html.find('alt="', tag_start)
+                if alt_at != -1 and alt_at < i:
+                    var vend = html.find('"', alt_at + 5)
+                    if vend != -1 and vend < i:
+                        out += _sub(html, alt_at + 5, vend)
             continue
         out += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
         i += 1
@@ -1660,7 +1704,7 @@ def render_blocks(
                 content += _strip_columns_raw(lines[j], fence_indent) + "\n"
                 j += 1
             var info = fence[3]
-            var first_word = _unescape_backslash(String(info.split(" ")[0])) if info != "" else String()
+            var first_word = _decode_entities(_unescape_backslash(String(info.split(" ")[0]))) if info != "" else String()
             out += "<pre><code"
             if first_word != "":
                 if ctx.site:
@@ -1696,6 +1740,8 @@ def render_blocks(
             and line.as_bytes()[qpos] == 0x3E
         ):
             var inner_lines = List[String]()
+            var inner_direct = List[Bool]()
+            var para_open = False
             var j = i
             while j < hi and not consumed[j] and not _is_blank(lines[j]):
                 var ql = lines[j]
@@ -1720,13 +1766,35 @@ def render_blocks(
                         stripped = _content_after(ql, after, acol, acol + 1)
                     else:
                         stripped = _sub(ql, after, ql.byte_length())
+                    para_open = _leaf_is_paragraph(_bq_strip(stripped)[1])
                     inner_lines.append(stripped^)
+                    inner_direct.append(True)
                     j += 1
                     continue
                 if _block_starts(ql, False):
                     break
+                if not para_open:
+                    # Lazy continuation exists only for an open
+                    # paragraph inside the quote.
+                    break
                 inner_lines.append(ql.copy())  # lazy continuation
+                inner_direct.append(False)
                 j += 1
+            # A lazy setext underline cannot convert a paragraph whose
+            # last line sits inside the quote: hand the underline back
+            # to this frame.
+            while len(inner_lines) >= 2:
+                var last = len(inner_lines) - 1
+                if (
+                    not inner_direct[last]
+                    and inner_direct[last - 1]
+                    and _setext_level(inner_lines[last]) > 0
+                ):
+                    _ = inner_lines.pop()
+                    _ = inner_direct.pop()
+                    j -= 1
+                else:
+                    break
             var no_consume = List[Bool]()
             for _ in range(len(inner_lines)):
                 no_consume.append(False)
@@ -1761,17 +1829,19 @@ def render_blocks(
         if _leading_spaces(line) >= 4:
             var j = i
             var content = String()
-            var pending_blanks = 0
+            var pending = List[String]()
             while j < hi:
                 if _is_blank(lines[j]):
-                    pending_blanks += 1
+                    # A whitespace-only line inside the block keeps
+                    # whatever indentation survives the 4-column strip.
+                    pending.append(_strip_columns_raw(lines[j], 4))
                     j += 1
                     continue
                 if _leading_spaces(lines[j]) < 4:
                     break
-                for _ in range(pending_blanks):
-                    content += "\n"
-                pending_blanks = 0
+                for ref p in pending:
+                    content += p + "\n"
+                pending.clear()
                 content += _strip_columns_raw(lines[j], 4) + "\n"
                 j += 1
             out += "<pre><code>" + escape_text(content) + "</code></pre>\n"
@@ -1872,84 +1942,4344 @@ def render_html(source: String) raises -> String:
 
 
 def _entity_value(name: String) -> String:
-    """A deliberately small named-entity table: the entities the estate's
-    corpora and the spec's own examples exercise. Unknown names stay
-    literal text. Returns "" when the name is not in the table."""
+    """The HTML5 named character references (semicolon forms;
+    CommonMark does not recognize the legacy no-semicolon forms).
+    Generated from the HTML5 entity list. Returns "" when the
+    name is not a reference."""
+    if name == "AElig":
+        return "Æ"
+    if name == "AMP":
+        return "&"
+    if name == "Aacute":
+        return "Á"
+    if name == "Abreve":
+        return "Ă"
+    if name == "Acirc":
+        return "Â"
+    if name == "Acy":
+        return "А"
+    if name == "Afr":
+        return "𝔄"
+    if name == "Agrave":
+        return "À"
+    if name == "Alpha":
+        return "Α"
+    if name == "Amacr":
+        return "Ā"
+    if name == "And":
+        return "⩓"
+    if name == "Aogon":
+        return "Ą"
+    if name == "Aopf":
+        return "𝔸"
+    if name == "ApplyFunction":
+        return "⁡"
+    if name == "Aring":
+        return "Å"
+    if name == "Ascr":
+        return "𝒜"
+    if name == "Assign":
+        return "≔"
+    if name == "Atilde":
+        return "Ã"
+    if name == "Auml":
+        return "Ä"
+    if name == "Backslash":
+        return "∖"
+    if name == "Barv":
+        return "⫧"
+    if name == "Barwed":
+        return "⌆"
+    if name == "Bcy":
+        return "Б"
+    if name == "Because":
+        return "∵"
+    if name == "Bernoullis":
+        return "ℬ"
+    if name == "Beta":
+        return "Β"
+    if name == "Bfr":
+        return "𝔅"
+    if name == "Bopf":
+        return "𝔹"
+    if name == "Breve":
+        return "˘"
+    if name == "Bscr":
+        return "ℬ"
+    if name == "Bumpeq":
+        return "≎"
+    if name == "CHcy":
+        return "Ч"
+    if name == "COPY":
+        return "©"
+    if name == "Cacute":
+        return "Ć"
+    if name == "Cap":
+        return "⋒"
+    if name == "CapitalDifferentialD":
+        return "ⅅ"
+    if name == "Cayleys":
+        return "ℭ"
+    if name == "Ccaron":
+        return "Č"
+    if name == "Ccedil":
+        return "Ç"
+    if name == "Ccirc":
+        return "Ĉ"
+    if name == "Cconint":
+        return "∰"
+    if name == "Cdot":
+        return "Ċ"
+    if name == "Cedilla":
+        return "¸"
+    if name == "CenterDot":
+        return "·"
+    if name == "Cfr":
+        return "ℭ"
+    if name == "Chi":
+        return "Χ"
+    if name == "CircleDot":
+        return "⊙"
+    if name == "CircleMinus":
+        return "⊖"
+    if name == "CirclePlus":
+        return "⊕"
+    if name == "CircleTimes":
+        return "⊗"
+    if name == "ClockwiseContourIntegral":
+        return "∲"
+    if name == "CloseCurlyDoubleQuote":
+        return "”"
+    if name == "CloseCurlyQuote":
+        return "’"
+    if name == "Colon":
+        return "∷"
+    if name == "Colone":
+        return "⩴"
+    if name == "Congruent":
+        return "≡"
+    if name == "Conint":
+        return "∯"
+    if name == "ContourIntegral":
+        return "∮"
+    if name == "Copf":
+        return "ℂ"
+    if name == "Coproduct":
+        return "∐"
+    if name == "CounterClockwiseContourIntegral":
+        return "∳"
+    if name == "Cross":
+        return "⨯"
+    if name == "Cscr":
+        return "𝒞"
+    if name == "Cup":
+        return "⋓"
+    if name == "CupCap":
+        return "≍"
+    if name == "DD":
+        return "ⅅ"
+    if name == "DDotrahd":
+        return "⤑"
+    if name == "DJcy":
+        return "Ђ"
+    if name == "DScy":
+        return "Ѕ"
+    if name == "DZcy":
+        return "Џ"
+    if name == "Dagger":
+        return "‡"
+    if name == "Darr":
+        return "↡"
+    if name == "Dashv":
+        return "⫤"
+    if name == "Dcaron":
+        return "Ď"
+    if name == "Dcy":
+        return "Д"
+    if name == "Del":
+        return "∇"
+    if name == "Delta":
+        return "Δ"
+    if name == "Dfr":
+        return "𝔇"
+    if name == "DiacriticalAcute":
+        return "´"
+    if name == "DiacriticalDot":
+        return "˙"
+    if name == "DiacriticalDoubleAcute":
+        return "˝"
+    if name == "DiacriticalGrave":
+        return "`"
+    if name == "DiacriticalTilde":
+        return "˜"
+    if name == "Diamond":
+        return "⋄"
+    if name == "DifferentialD":
+        return "ⅆ"
+    if name == "Dopf":
+        return "𝔻"
+    if name == "Dot":
+        return "¨"
+    if name == "DotDot":
+        return "⃜"
+    if name == "DotEqual":
+        return "≐"
+    if name == "DoubleContourIntegral":
+        return "∯"
+    if name == "DoubleDot":
+        return "¨"
+    if name == "DoubleDownArrow":
+        return "⇓"
+    if name == "DoubleLeftArrow":
+        return "⇐"
+    if name == "DoubleLeftRightArrow":
+        return "⇔"
+    if name == "DoubleLeftTee":
+        return "⫤"
+    if name == "DoubleLongLeftArrow":
+        return "⟸"
+    if name == "DoubleLongLeftRightArrow":
+        return "⟺"
+    if name == "DoubleLongRightArrow":
+        return "⟹"
+    if name == "DoubleRightArrow":
+        return "⇒"
+    if name == "DoubleRightTee":
+        return "⊨"
+    if name == "DoubleUpArrow":
+        return "⇑"
+    if name == "DoubleUpDownArrow":
+        return "⇕"
+    if name == "DoubleVerticalBar":
+        return "∥"
+    if name == "DownArrow":
+        return "↓"
+    if name == "DownArrowBar":
+        return "⤓"
+    if name == "DownArrowUpArrow":
+        return "⇵"
+    if name == "DownBreve":
+        return "̑"
+    if name == "DownLeftRightVector":
+        return "⥐"
+    if name == "DownLeftTeeVector":
+        return "⥞"
+    if name == "DownLeftVector":
+        return "↽"
+    if name == "DownLeftVectorBar":
+        return "⥖"
+    if name == "DownRightTeeVector":
+        return "⥟"
+    if name == "DownRightVector":
+        return "⇁"
+    if name == "DownRightVectorBar":
+        return "⥗"
+    if name == "DownTee":
+        return "⊤"
+    if name == "DownTeeArrow":
+        return "↧"
+    if name == "Downarrow":
+        return "⇓"
+    if name == "Dscr":
+        return "𝒟"
+    if name == "Dstrok":
+        return "Đ"
+    if name == "ENG":
+        return "Ŋ"
+    if name == "ETH":
+        return "Ð"
+    if name == "Eacute":
+        return "É"
+    if name == "Ecaron":
+        return "Ě"
+    if name == "Ecirc":
+        return "Ê"
+    if name == "Ecy":
+        return "Э"
+    if name == "Edot":
+        return "Ė"
+    if name == "Efr":
+        return "𝔈"
+    if name == "Egrave":
+        return "È"
+    if name == "Element":
+        return "∈"
+    if name == "Emacr":
+        return "Ē"
+    if name == "EmptySmallSquare":
+        return "◻"
+    if name == "EmptyVerySmallSquare":
+        return "▫"
+    if name == "Eogon":
+        return "Ę"
+    if name == "Eopf":
+        return "𝔼"
+    if name == "Epsilon":
+        return "Ε"
+    if name == "Equal":
+        return "⩵"
+    if name == "EqualTilde":
+        return "≂"
+    if name == "Equilibrium":
+        return "⇌"
+    if name == "Escr":
+        return "ℰ"
+    if name == "Esim":
+        return "⩳"
+    if name == "Eta":
+        return "Η"
+    if name == "Euml":
+        return "Ë"
+    if name == "Exists":
+        return "∃"
+    if name == "ExponentialE":
+        return "ⅇ"
+    if name == "Fcy":
+        return "Ф"
+    if name == "Ffr":
+        return "𝔉"
+    if name == "FilledSmallSquare":
+        return "◼"
+    if name == "FilledVerySmallSquare":
+        return "▪"
+    if name == "Fopf":
+        return "𝔽"
+    if name == "ForAll":
+        return "∀"
+    if name == "Fouriertrf":
+        return "ℱ"
+    if name == "Fscr":
+        return "ℱ"
+    if name == "GJcy":
+        return "Ѓ"
+    if name == "GT":
+        return ">"
+    if name == "Gamma":
+        return "Γ"
+    if name == "Gammad":
+        return "Ϝ"
+    if name == "Gbreve":
+        return "Ğ"
+    if name == "Gcedil":
+        return "Ģ"
+    if name == "Gcirc":
+        return "Ĝ"
+    if name == "Gcy":
+        return "Г"
+    if name == "Gdot":
+        return "Ġ"
+    if name == "Gfr":
+        return "𝔊"
+    if name == "Gg":
+        return "⋙"
+    if name == "Gopf":
+        return "𝔾"
+    if name == "GreaterEqual":
+        return "≥"
+    if name == "GreaterEqualLess":
+        return "⋛"
+    if name == "GreaterFullEqual":
+        return "≧"
+    if name == "GreaterGreater":
+        return "⪢"
+    if name == "GreaterLess":
+        return "≷"
+    if name == "GreaterSlantEqual":
+        return "⩾"
+    if name == "GreaterTilde":
+        return "≳"
+    if name == "Gscr":
+        return "𝒢"
+    if name == "Gt":
+        return "≫"
+    if name == "HARDcy":
+        return "Ъ"
+    if name == "Hacek":
+        return "ˇ"
+    if name == "Hat":
+        return "^"
+    if name == "Hcirc":
+        return "Ĥ"
+    if name == "Hfr":
+        return "ℌ"
+    if name == "HilbertSpace":
+        return "ℋ"
+    if name == "Hopf":
+        return "ℍ"
+    if name == "HorizontalLine":
+        return "─"
+    if name == "Hscr":
+        return "ℋ"
+    if name == "Hstrok":
+        return "Ħ"
+    if name == "HumpDownHump":
+        return "≎"
+    if name == "HumpEqual":
+        return "≏"
+    if name == "IEcy":
+        return "Е"
+    if name == "IJlig":
+        return "Ĳ"
+    if name == "IOcy":
+        return "Ё"
+    if name == "Iacute":
+        return "Í"
+    if name == "Icirc":
+        return "Î"
+    if name == "Icy":
+        return "И"
+    if name == "Idot":
+        return "İ"
+    if name == "Ifr":
+        return "ℑ"
+    if name == "Igrave":
+        return "Ì"
+    if name == "Im":
+        return "ℑ"
+    if name == "Imacr":
+        return "Ī"
+    if name == "ImaginaryI":
+        return "ⅈ"
+    if name == "Implies":
+        return "⇒"
+    if name == "Int":
+        return "∬"
+    if name == "Integral":
+        return "∫"
+    if name == "Intersection":
+        return "⋂"
+    if name == "InvisibleComma":
+        return "⁣"
+    if name == "InvisibleTimes":
+        return "⁢"
+    if name == "Iogon":
+        return "Į"
+    if name == "Iopf":
+        return "𝕀"
+    if name == "Iota":
+        return "Ι"
+    if name == "Iscr":
+        return "ℐ"
+    if name == "Itilde":
+        return "Ĩ"
+    if name == "Iukcy":
+        return "І"
+    if name == "Iuml":
+        return "Ï"
+    if name == "Jcirc":
+        return "Ĵ"
+    if name == "Jcy":
+        return "Й"
+    if name == "Jfr":
+        return "𝔍"
+    if name == "Jopf":
+        return "𝕁"
+    if name == "Jscr":
+        return "𝒥"
+    if name == "Jsercy":
+        return "Ј"
+    if name == "Jukcy":
+        return "Є"
+    if name == "KHcy":
+        return "Х"
+    if name == "KJcy":
+        return "Ќ"
+    if name == "Kappa":
+        return "Κ"
+    if name == "Kcedil":
+        return "Ķ"
+    if name == "Kcy":
+        return "К"
+    if name == "Kfr":
+        return "𝔎"
+    if name == "Kopf":
+        return "𝕂"
+    if name == "Kscr":
+        return "𝒦"
+    if name == "LJcy":
+        return "Љ"
+    if name == "LT":
+        return "<"
+    if name == "Lacute":
+        return "Ĺ"
+    if name == "Lambda":
+        return "Λ"
+    if name == "Lang":
+        return "⟪"
+    if name == "Laplacetrf":
+        return "ℒ"
+    if name == "Larr":
+        return "↞"
+    if name == "Lcaron":
+        return "Ľ"
+    if name == "Lcedil":
+        return "Ļ"
+    if name == "Lcy":
+        return "Л"
+    if name == "LeftAngleBracket":
+        return "⟨"
+    if name == "LeftArrow":
+        return "←"
+    if name == "LeftArrowBar":
+        return "⇤"
+    if name == "LeftArrowRightArrow":
+        return "⇆"
+    if name == "LeftCeiling":
+        return "⌈"
+    if name == "LeftDoubleBracket":
+        return "⟦"
+    if name == "LeftDownTeeVector":
+        return "⥡"
+    if name == "LeftDownVector":
+        return "⇃"
+    if name == "LeftDownVectorBar":
+        return "⥙"
+    if name == "LeftFloor":
+        return "⌊"
+    if name == "LeftRightArrow":
+        return "↔"
+    if name == "LeftRightVector":
+        return "⥎"
+    if name == "LeftTee":
+        return "⊣"
+    if name == "LeftTeeArrow":
+        return "↤"
+    if name == "LeftTeeVector":
+        return "⥚"
+    if name == "LeftTriangle":
+        return "⊲"
+    if name == "LeftTriangleBar":
+        return "⧏"
+    if name == "LeftTriangleEqual":
+        return "⊴"
+    if name == "LeftUpDownVector":
+        return "⥑"
+    if name == "LeftUpTeeVector":
+        return "⥠"
+    if name == "LeftUpVector":
+        return "↿"
+    if name == "LeftUpVectorBar":
+        return "⥘"
+    if name == "LeftVector":
+        return "↼"
+    if name == "LeftVectorBar":
+        return "⥒"
+    if name == "Leftarrow":
+        return "⇐"
+    if name == "Leftrightarrow":
+        return "⇔"
+    if name == "LessEqualGreater":
+        return "⋚"
+    if name == "LessFullEqual":
+        return "≦"
+    if name == "LessGreater":
+        return "≶"
+    if name == "LessLess":
+        return "⪡"
+    if name == "LessSlantEqual":
+        return "⩽"
+    if name == "LessTilde":
+        return "≲"
+    if name == "Lfr":
+        return "𝔏"
+    if name == "Ll":
+        return "⋘"
+    if name == "Lleftarrow":
+        return "⇚"
+    if name == "Lmidot":
+        return "Ŀ"
+    if name == "LongLeftArrow":
+        return "⟵"
+    if name == "LongLeftRightArrow":
+        return "⟷"
+    if name == "LongRightArrow":
+        return "⟶"
+    if name == "Longleftarrow":
+        return "⟸"
+    if name == "Longleftrightarrow":
+        return "⟺"
+    if name == "Longrightarrow":
+        return "⟹"
+    if name == "Lopf":
+        return "𝕃"
+    if name == "LowerLeftArrow":
+        return "↙"
+    if name == "LowerRightArrow":
+        return "↘"
+    if name == "Lscr":
+        return "ℒ"
+    if name == "Lsh":
+        return "↰"
+    if name == "Lstrok":
+        return "Ł"
+    if name == "Lt":
+        return "≪"
+    if name == "Map":
+        return "⤅"
+    if name == "Mcy":
+        return "М"
+    if name == "MediumSpace":
+        return " "
+    if name == "Mellintrf":
+        return "ℳ"
+    if name == "Mfr":
+        return "𝔐"
+    if name == "MinusPlus":
+        return "∓"
+    if name == "Mopf":
+        return "𝕄"
+    if name == "Mscr":
+        return "ℳ"
+    if name == "Mu":
+        return "Μ"
+    if name == "NJcy":
+        return "Њ"
+    if name == "Nacute":
+        return "Ń"
+    if name == "Ncaron":
+        return "Ň"
+    if name == "Ncedil":
+        return "Ņ"
+    if name == "Ncy":
+        return "Н"
+    if name == "NegativeMediumSpace":
+        return "​"
+    if name == "NegativeThickSpace":
+        return "​"
+    if name == "NegativeThinSpace":
+        return "​"
+    if name == "NegativeVeryThinSpace":
+        return "​"
+    if name == "NestedGreaterGreater":
+        return "≫"
+    if name == "NestedLessLess":
+        return "≪"
+    if name == "NewLine":
+        return "\n"
+    if name == "Nfr":
+        return "𝔑"
+    if name == "NoBreak":
+        return "⁠"
+    if name == "NonBreakingSpace":
+        return " "
+    if name == "Nopf":
+        return "ℕ"
+    if name == "Not":
+        return "⫬"
+    if name == "NotCongruent":
+        return "≢"
+    if name == "NotCupCap":
+        return "≭"
+    if name == "NotDoubleVerticalBar":
+        return "∦"
+    if name == "NotElement":
+        return "∉"
+    if name == "NotEqual":
+        return "≠"
+    if name == "NotEqualTilde":
+        return "≂̸"
+    if name == "NotExists":
+        return "∄"
+    if name == "NotGreater":
+        return "≯"
+    if name == "NotGreaterEqual":
+        return "≱"
+    if name == "NotGreaterFullEqual":
+        return "≧̸"
+    if name == "NotGreaterGreater":
+        return "≫̸"
+    if name == "NotGreaterLess":
+        return "≹"
+    if name == "NotGreaterSlantEqual":
+        return "⩾̸"
+    if name == "NotGreaterTilde":
+        return "≵"
+    if name == "NotHumpDownHump":
+        return "≎̸"
+    if name == "NotHumpEqual":
+        return "≏̸"
+    if name == "NotLeftTriangle":
+        return "⋪"
+    if name == "NotLeftTriangleBar":
+        return "⧏̸"
+    if name == "NotLeftTriangleEqual":
+        return "⋬"
+    if name == "NotLess":
+        return "≮"
+    if name == "NotLessEqual":
+        return "≰"
+    if name == "NotLessGreater":
+        return "≸"
+    if name == "NotLessLess":
+        return "≪̸"
+    if name == "NotLessSlantEqual":
+        return "⩽̸"
+    if name == "NotLessTilde":
+        return "≴"
+    if name == "NotNestedGreaterGreater":
+        return "⪢̸"
+    if name == "NotNestedLessLess":
+        return "⪡̸"
+    if name == "NotPrecedes":
+        return "⊀"
+    if name == "NotPrecedesEqual":
+        return "⪯̸"
+    if name == "NotPrecedesSlantEqual":
+        return "⋠"
+    if name == "NotReverseElement":
+        return "∌"
+    if name == "NotRightTriangle":
+        return "⋫"
+    if name == "NotRightTriangleBar":
+        return "⧐̸"
+    if name == "NotRightTriangleEqual":
+        return "⋭"
+    if name == "NotSquareSubset":
+        return "⊏̸"
+    if name == "NotSquareSubsetEqual":
+        return "⋢"
+    if name == "NotSquareSuperset":
+        return "⊐̸"
+    if name == "NotSquareSupersetEqual":
+        return "⋣"
+    if name == "NotSubset":
+        return "⊂⃒"
+    if name == "NotSubsetEqual":
+        return "⊈"
+    if name == "NotSucceeds":
+        return "⊁"
+    if name == "NotSucceedsEqual":
+        return "⪰̸"
+    if name == "NotSucceedsSlantEqual":
+        return "⋡"
+    if name == "NotSucceedsTilde":
+        return "≿̸"
+    if name == "NotSuperset":
+        return "⊃⃒"
+    if name == "NotSupersetEqual":
+        return "⊉"
+    if name == "NotTilde":
+        return "≁"
+    if name == "NotTildeEqual":
+        return "≄"
+    if name == "NotTildeFullEqual":
+        return "≇"
+    if name == "NotTildeTilde":
+        return "≉"
+    if name == "NotVerticalBar":
+        return "∤"
+    if name == "Nscr":
+        return "𝒩"
+    if name == "Ntilde":
+        return "Ñ"
+    if name == "Nu":
+        return "Ν"
+    if name == "OElig":
+        return "Œ"
+    if name == "Oacute":
+        return "Ó"
+    if name == "Ocirc":
+        return "Ô"
+    if name == "Ocy":
+        return "О"
+    if name == "Odblac":
+        return "Ő"
+    if name == "Ofr":
+        return "𝔒"
+    if name == "Ograve":
+        return "Ò"
+    if name == "Omacr":
+        return "Ō"
+    if name == "Omega":
+        return "Ω"
+    if name == "Omicron":
+        return "Ο"
+    if name == "Oopf":
+        return "𝕆"
+    if name == "OpenCurlyDoubleQuote":
+        return "“"
+    if name == "OpenCurlyQuote":
+        return "‘"
+    if name == "Or":
+        return "⩔"
+    if name == "Oscr":
+        return "𝒪"
+    if name == "Oslash":
+        return "Ø"
+    if name == "Otilde":
+        return "Õ"
+    if name == "Otimes":
+        return "⨷"
+    if name == "Ouml":
+        return "Ö"
+    if name == "OverBar":
+        return "‾"
+    if name == "OverBrace":
+        return "⏞"
+    if name == "OverBracket":
+        return "⎴"
+    if name == "OverParenthesis":
+        return "⏜"
+    if name == "PartialD":
+        return "∂"
+    if name == "Pcy":
+        return "П"
+    if name == "Pfr":
+        return "𝔓"
+    if name == "Phi":
+        return "Φ"
+    if name == "Pi":
+        return "Π"
+    if name == "PlusMinus":
+        return "±"
+    if name == "Poincareplane":
+        return "ℌ"
+    if name == "Popf":
+        return "ℙ"
+    if name == "Pr":
+        return "⪻"
+    if name == "Precedes":
+        return "≺"
+    if name == "PrecedesEqual":
+        return "⪯"
+    if name == "PrecedesSlantEqual":
+        return "≼"
+    if name == "PrecedesTilde":
+        return "≾"
+    if name == "Prime":
+        return "″"
+    if name == "Product":
+        return "∏"
+    if name == "Proportion":
+        return "∷"
+    if name == "Proportional":
+        return "∝"
+    if name == "Pscr":
+        return "𝒫"
+    if name == "Psi":
+        return "Ψ"
+    if name == "QUOT":
+        return "\""
+    if name == "Qfr":
+        return "𝔔"
+    if name == "Qopf":
+        return "ℚ"
+    if name == "Qscr":
+        return "𝒬"
+    if name == "RBarr":
+        return "⤐"
+    if name == "REG":
+        return "®"
+    if name == "Racute":
+        return "Ŕ"
+    if name == "Rang":
+        return "⟫"
+    if name == "Rarr":
+        return "↠"
+    if name == "Rarrtl":
+        return "⤖"
+    if name == "Rcaron":
+        return "Ř"
+    if name == "Rcedil":
+        return "Ŗ"
+    if name == "Rcy":
+        return "Р"
+    if name == "Re":
+        return "ℜ"
+    if name == "ReverseElement":
+        return "∋"
+    if name == "ReverseEquilibrium":
+        return "⇋"
+    if name == "ReverseUpEquilibrium":
+        return "⥯"
+    if name == "Rfr":
+        return "ℜ"
+    if name == "Rho":
+        return "Ρ"
+    if name == "RightAngleBracket":
+        return "⟩"
+    if name == "RightArrow":
+        return "→"
+    if name == "RightArrowBar":
+        return "⇥"
+    if name == "RightArrowLeftArrow":
+        return "⇄"
+    if name == "RightCeiling":
+        return "⌉"
+    if name == "RightDoubleBracket":
+        return "⟧"
+    if name == "RightDownTeeVector":
+        return "⥝"
+    if name == "RightDownVector":
+        return "⇂"
+    if name == "RightDownVectorBar":
+        return "⥕"
+    if name == "RightFloor":
+        return "⌋"
+    if name == "RightTee":
+        return "⊢"
+    if name == "RightTeeArrow":
+        return "↦"
+    if name == "RightTeeVector":
+        return "⥛"
+    if name == "RightTriangle":
+        return "⊳"
+    if name == "RightTriangleBar":
+        return "⧐"
+    if name == "RightTriangleEqual":
+        return "⊵"
+    if name == "RightUpDownVector":
+        return "⥏"
+    if name == "RightUpTeeVector":
+        return "⥜"
+    if name == "RightUpVector":
+        return "↾"
+    if name == "RightUpVectorBar":
+        return "⥔"
+    if name == "RightVector":
+        return "⇀"
+    if name == "RightVectorBar":
+        return "⥓"
+    if name == "Rightarrow":
+        return "⇒"
+    if name == "Ropf":
+        return "ℝ"
+    if name == "RoundImplies":
+        return "⥰"
+    if name == "Rrightarrow":
+        return "⇛"
+    if name == "Rscr":
+        return "ℛ"
+    if name == "Rsh":
+        return "↱"
+    if name == "RuleDelayed":
+        return "⧴"
+    if name == "SHCHcy":
+        return "Щ"
+    if name == "SHcy":
+        return "Ш"
+    if name == "SOFTcy":
+        return "Ь"
+    if name == "Sacute":
+        return "Ś"
+    if name == "Sc":
+        return "⪼"
+    if name == "Scaron":
+        return "Š"
+    if name == "Scedil":
+        return "Ş"
+    if name == "Scirc":
+        return "Ŝ"
+    if name == "Scy":
+        return "С"
+    if name == "Sfr":
+        return "𝔖"
+    if name == "ShortDownArrow":
+        return "↓"
+    if name == "ShortLeftArrow":
+        return "←"
+    if name == "ShortRightArrow":
+        return "→"
+    if name == "ShortUpArrow":
+        return "↑"
+    if name == "Sigma":
+        return "Σ"
+    if name == "SmallCircle":
+        return "∘"
+    if name == "Sopf":
+        return "𝕊"
+    if name == "Sqrt":
+        return "√"
+    if name == "Square":
+        return "□"
+    if name == "SquareIntersection":
+        return "⊓"
+    if name == "SquareSubset":
+        return "⊏"
+    if name == "SquareSubsetEqual":
+        return "⊑"
+    if name == "SquareSuperset":
+        return "⊐"
+    if name == "SquareSupersetEqual":
+        return "⊒"
+    if name == "SquareUnion":
+        return "⊔"
+    if name == "Sscr":
+        return "𝒮"
+    if name == "Star":
+        return "⋆"
+    if name == "Sub":
+        return "⋐"
+    if name == "Subset":
+        return "⋐"
+    if name == "SubsetEqual":
+        return "⊆"
+    if name == "Succeeds":
+        return "≻"
+    if name == "SucceedsEqual":
+        return "⪰"
+    if name == "SucceedsSlantEqual":
+        return "≽"
+    if name == "SucceedsTilde":
+        return "≿"
+    if name == "SuchThat":
+        return "∋"
+    if name == "Sum":
+        return "∑"
+    if name == "Sup":
+        return "⋑"
+    if name == "Superset":
+        return "⊃"
+    if name == "SupersetEqual":
+        return "⊇"
+    if name == "Supset":
+        return "⋑"
+    if name == "THORN":
+        return "Þ"
+    if name == "TRADE":
+        return "™"
+    if name == "TSHcy":
+        return "Ћ"
+    if name == "TScy":
+        return "Ц"
+    if name == "Tab":
+        return "\t"
+    if name == "Tau":
+        return "Τ"
+    if name == "Tcaron":
+        return "Ť"
+    if name == "Tcedil":
+        return "Ţ"
+    if name == "Tcy":
+        return "Т"
+    if name == "Tfr":
+        return "𝔗"
+    if name == "Therefore":
+        return "∴"
+    if name == "Theta":
+        return "Θ"
+    if name == "ThickSpace":
+        return "  "
+    if name == "ThinSpace":
+        return " "
+    if name == "Tilde":
+        return "∼"
+    if name == "TildeEqual":
+        return "≃"
+    if name == "TildeFullEqual":
+        return "≅"
+    if name == "TildeTilde":
+        return "≈"
+    if name == "Topf":
+        return "𝕋"
+    if name == "TripleDot":
+        return "⃛"
+    if name == "Tscr":
+        return "𝒯"
+    if name == "Tstrok":
+        return "Ŧ"
+    if name == "Uacute":
+        return "Ú"
+    if name == "Uarr":
+        return "↟"
+    if name == "Uarrocir":
+        return "⥉"
+    if name == "Ubrcy":
+        return "Ў"
+    if name == "Ubreve":
+        return "Ŭ"
+    if name == "Ucirc":
+        return "Û"
+    if name == "Ucy":
+        return "У"
+    if name == "Udblac":
+        return "Ű"
+    if name == "Ufr":
+        return "𝔘"
+    if name == "Ugrave":
+        return "Ù"
+    if name == "Umacr":
+        return "Ū"
+    if name == "UnderBar":
+        return "_"
+    if name == "UnderBrace":
+        return "⏟"
+    if name == "UnderBracket":
+        return "⎵"
+    if name == "UnderParenthesis":
+        return "⏝"
+    if name == "Union":
+        return "⋃"
+    if name == "UnionPlus":
+        return "⊎"
+    if name == "Uogon":
+        return "Ų"
+    if name == "Uopf":
+        return "𝕌"
+    if name == "UpArrow":
+        return "↑"
+    if name == "UpArrowBar":
+        return "⤒"
+    if name == "UpArrowDownArrow":
+        return "⇅"
+    if name == "UpDownArrow":
+        return "↕"
+    if name == "UpEquilibrium":
+        return "⥮"
+    if name == "UpTee":
+        return "⊥"
+    if name == "UpTeeArrow":
+        return "↥"
+    if name == "Uparrow":
+        return "⇑"
+    if name == "Updownarrow":
+        return "⇕"
+    if name == "UpperLeftArrow":
+        return "↖"
+    if name == "UpperRightArrow":
+        return "↗"
+    if name == "Upsi":
+        return "ϒ"
+    if name == "Upsilon":
+        return "Υ"
+    if name == "Uring":
+        return "Ů"
+    if name == "Uscr":
+        return "𝒰"
+    if name == "Utilde":
+        return "Ũ"
+    if name == "Uuml":
+        return "Ü"
+    if name == "VDash":
+        return "⊫"
+    if name == "Vbar":
+        return "⫫"
+    if name == "Vcy":
+        return "В"
+    if name == "Vdash":
+        return "⊩"
+    if name == "Vdashl":
+        return "⫦"
+    if name == "Vee":
+        return "⋁"
+    if name == "Verbar":
+        return "‖"
+    if name == "Vert":
+        return "‖"
+    if name == "VerticalBar":
+        return "∣"
+    if name == "VerticalLine":
+        return "|"
+    if name == "VerticalSeparator":
+        return "❘"
+    if name == "VerticalTilde":
+        return "≀"
+    if name == "VeryThinSpace":
+        return " "
+    if name == "Vfr":
+        return "𝔙"
+    if name == "Vopf":
+        return "𝕍"
+    if name == "Vscr":
+        return "𝒱"
+    if name == "Vvdash":
+        return "⊪"
+    if name == "Wcirc":
+        return "Ŵ"
+    if name == "Wedge":
+        return "⋀"
+    if name == "Wfr":
+        return "𝔚"
+    if name == "Wopf":
+        return "𝕎"
+    if name == "Wscr":
+        return "𝒲"
+    if name == "Xfr":
+        return "𝔛"
+    if name == "Xi":
+        return "Ξ"
+    if name == "Xopf":
+        return "𝕏"
+    if name == "Xscr":
+        return "𝒳"
+    if name == "YAcy":
+        return "Я"
+    if name == "YIcy":
+        return "Ї"
+    if name == "YUcy":
+        return "Ю"
+    if name == "Yacute":
+        return "Ý"
+    if name == "Ycirc":
+        return "Ŷ"
+    if name == "Ycy":
+        return "Ы"
+    if name == "Yfr":
+        return "𝔜"
+    if name == "Yopf":
+        return "𝕐"
+    if name == "Yscr":
+        return "𝒴"
+    if name == "Yuml":
+        return "Ÿ"
+    if name == "ZHcy":
+        return "Ж"
+    if name == "Zacute":
+        return "Ź"
+    if name == "Zcaron":
+        return "Ž"
+    if name == "Zcy":
+        return "З"
+    if name == "Zdot":
+        return "Ż"
+    if name == "ZeroWidthSpace":
+        return "​"
+    if name == "Zeta":
+        return "Ζ"
+    if name == "Zfr":
+        return "ℨ"
+    if name == "Zopf":
+        return "ℤ"
+    if name == "Zscr":
+        return "𝒵"
+    if name == "aacute":
+        return "á"
+    if name == "abreve":
+        return "ă"
+    if name == "ac":
+        return "∾"
+    if name == "acE":
+        return "∾̳"
+    if name == "acd":
+        return "∿"
+    if name == "acirc":
+        return "â"
+    if name == "acute":
+        return "´"
+    if name == "acy":
+        return "а"
+    if name == "aelig":
+        return "æ"
+    if name == "af":
+        return "⁡"
+    if name == "afr":
+        return "𝔞"
+    if name == "agrave":
+        return "à"
+    if name == "alefsym":
+        return "ℵ"
+    if name == "aleph":
+        return "ℵ"
+    if name == "alpha":
+        return "α"
+    if name == "amacr":
+        return "ā"
+    if name == "amalg":
+        return "⨿"
     if name == "amp":
         return "&"
+    if name == "and":
+        return "∧"
+    if name == "andand":
+        return "⩕"
+    if name == "andd":
+        return "⩜"
+    if name == "andslope":
+        return "⩘"
+    if name == "andv":
+        return "⩚"
+    if name == "ang":
+        return "∠"
+    if name == "ange":
+        return "⦤"
+    if name == "angle":
+        return "∠"
+    if name == "angmsd":
+        return "∡"
+    if name == "angmsdaa":
+        return "⦨"
+    if name == "angmsdab":
+        return "⦩"
+    if name == "angmsdac":
+        return "⦪"
+    if name == "angmsdad":
+        return "⦫"
+    if name == "angmsdae":
+        return "⦬"
+    if name == "angmsdaf":
+        return "⦭"
+    if name == "angmsdag":
+        return "⦮"
+    if name == "angmsdah":
+        return "⦯"
+    if name == "angrt":
+        return "∟"
+    if name == "angrtvb":
+        return "⊾"
+    if name == "angrtvbd":
+        return "⦝"
+    if name == "angsph":
+        return "∢"
+    if name == "angst":
+        return "Å"
+    if name == "angzarr":
+        return "⍼"
+    if name == "aogon":
+        return "ą"
+    if name == "aopf":
+        return "𝕒"
+    if name == "ap":
+        return "≈"
+    if name == "apE":
+        return "⩰"
+    if name == "apacir":
+        return "⩯"
+    if name == "ape":
+        return "≊"
+    if name == "apid":
+        return "≋"
     if name == "apos":
         return "'"
+    if name == "approx":
+        return "≈"
+    if name == "approxeq":
+        return "≊"
+    if name == "aring":
+        return "å"
+    if name == "ascr":
+        return "𝒶"
+    if name == "ast":
+        return "*"
+    if name == "asymp":
+        return "≈"
+    if name == "asympeq":
+        return "≍"
+    if name == "atilde":
+        return "ã"
+    if name == "auml":
+        return "ä"
+    if name == "awconint":
+        return "∳"
+    if name == "awint":
+        return "⨑"
+    if name == "bNot":
+        return "⫭"
+    if name == "backcong":
+        return "≌"
+    if name == "backepsilon":
+        return "϶"
+    if name == "backprime":
+        return "‵"
+    if name == "backsim":
+        return "∽"
+    if name == "backsimeq":
+        return "⋍"
+    if name == "barvee":
+        return "⊽"
+    if name == "barwed":
+        return "⌅"
+    if name == "barwedge":
+        return "⌅"
+    if name == "bbrk":
+        return "⎵"
+    if name == "bbrktbrk":
+        return "⎶"
+    if name == "bcong":
+        return "≌"
+    if name == "bcy":
+        return "б"
+    if name == "bdquo":
+        return "„"
+    if name == "becaus":
+        return "∵"
+    if name == "because":
+        return "∵"
+    if name == "bemptyv":
+        return "⦰"
+    if name == "bepsi":
+        return "϶"
+    if name == "bernou":
+        return "ℬ"
+    if name == "beta":
+        return "β"
+    if name == "beth":
+        return "ℶ"
+    if name == "between":
+        return "≬"
+    if name == "bfr":
+        return "𝔟"
+    if name == "bigcap":
+        return "⋂"
+    if name == "bigcirc":
+        return "◯"
+    if name == "bigcup":
+        return "⋃"
+    if name == "bigodot":
+        return "⨀"
+    if name == "bigoplus":
+        return "⨁"
+    if name == "bigotimes":
+        return "⨂"
+    if name == "bigsqcup":
+        return "⨆"
+    if name == "bigstar":
+        return "★"
+    if name == "bigtriangledown":
+        return "▽"
+    if name == "bigtriangleup":
+        return "△"
+    if name == "biguplus":
+        return "⨄"
+    if name == "bigvee":
+        return "⋁"
+    if name == "bigwedge":
+        return "⋀"
+    if name == "bkarow":
+        return "⤍"
+    if name == "blacklozenge":
+        return "⧫"
+    if name == "blacksquare":
+        return "▪"
+    if name == "blacktriangle":
+        return "▴"
+    if name == "blacktriangledown":
+        return "▾"
+    if name == "blacktriangleleft":
+        return "◂"
+    if name == "blacktriangleright":
+        return "▸"
+    if name == "blank":
+        return "␣"
+    if name == "blk12":
+        return "▒"
+    if name == "blk14":
+        return "░"
+    if name == "blk34":
+        return "▓"
+    if name == "block":
+        return "█"
+    if name == "bne":
+        return "=⃥"
+    if name == "bnequiv":
+        return "≡⃥"
+    if name == "bnot":
+        return "⌐"
+    if name == "bopf":
+        return "𝕓"
+    if name == "bot":
+        return "⊥"
+    if name == "bottom":
+        return "⊥"
+    if name == "bowtie":
+        return "⋈"
+    if name == "boxDL":
+        return "╗"
+    if name == "boxDR":
+        return "╔"
+    if name == "boxDl":
+        return "╖"
+    if name == "boxDr":
+        return "╓"
+    if name == "boxH":
+        return "═"
+    if name == "boxHD":
+        return "╦"
+    if name == "boxHU":
+        return "╩"
+    if name == "boxHd":
+        return "╤"
+    if name == "boxHu":
+        return "╧"
+    if name == "boxUL":
+        return "╝"
+    if name == "boxUR":
+        return "╚"
+    if name == "boxUl":
+        return "╜"
+    if name == "boxUr":
+        return "╙"
+    if name == "boxV":
+        return "║"
+    if name == "boxVH":
+        return "╬"
+    if name == "boxVL":
+        return "╣"
+    if name == "boxVR":
+        return "╠"
+    if name == "boxVh":
+        return "╫"
+    if name == "boxVl":
+        return "╢"
+    if name == "boxVr":
+        return "╟"
+    if name == "boxbox":
+        return "⧉"
+    if name == "boxdL":
+        return "╕"
+    if name == "boxdR":
+        return "╒"
+    if name == "boxdl":
+        return "┐"
+    if name == "boxdr":
+        return "┌"
+    if name == "boxh":
+        return "─"
+    if name == "boxhD":
+        return "╥"
+    if name == "boxhU":
+        return "╨"
+    if name == "boxhd":
+        return "┬"
+    if name == "boxhu":
+        return "┴"
+    if name == "boxminus":
+        return "⊟"
+    if name == "boxplus":
+        return "⊞"
+    if name == "boxtimes":
+        return "⊠"
+    if name == "boxuL":
+        return "╛"
+    if name == "boxuR":
+        return "╘"
+    if name == "boxul":
+        return "┘"
+    if name == "boxur":
+        return "└"
+    if name == "boxv":
+        return "│"
+    if name == "boxvH":
+        return "╪"
+    if name == "boxvL":
+        return "╡"
+    if name == "boxvR":
+        return "╞"
+    if name == "boxvh":
+        return "┼"
+    if name == "boxvl":
+        return "┤"
+    if name == "boxvr":
+        return "├"
+    if name == "bprime":
+        return "‵"
+    if name == "breve":
+        return "˘"
+    if name == "brvbar":
+        return "¦"
+    if name == "bscr":
+        return "𝒷"
+    if name == "bsemi":
+        return "⁏"
+    if name == "bsim":
+        return "∽"
+    if name == "bsime":
+        return "⋍"
+    if name == "bsol":
+        return "\\"
+    if name == "bsolb":
+        return "⧅"
+    if name == "bsolhsub":
+        return "⟈"
+    if name == "bull":
+        return "•"
+    if name == "bullet":
+        return "•"
+    if name == "bump":
+        return "≎"
+    if name == "bumpE":
+        return "⪮"
+    if name == "bumpe":
+        return "≏"
+    if name == "bumpeq":
+        return "≏"
+    if name == "cacute":
+        return "ć"
+    if name == "cap":
+        return "∩"
+    if name == "capand":
+        return "⩄"
+    if name == "capbrcup":
+        return "⩉"
+    if name == "capcap":
+        return "⩋"
+    if name == "capcup":
+        return "⩇"
+    if name == "capdot":
+        return "⩀"
+    if name == "caps":
+        return "∩︀"
+    if name == "caret":
+        return "⁁"
+    if name == "caron":
+        return "ˇ"
+    if name == "ccaps":
+        return "⩍"
+    if name == "ccaron":
+        return "č"
+    if name == "ccedil":
+        return "ç"
+    if name == "ccirc":
+        return "ĉ"
+    if name == "ccups":
+        return "⩌"
+    if name == "ccupssm":
+        return "⩐"
+    if name == "cdot":
+        return "ċ"
+    if name == "cedil":
+        return "¸"
+    if name == "cemptyv":
+        return "⦲"
+    if name == "cent":
+        return "¢"
+    if name == "centerdot":
+        return "·"
+    if name == "cfr":
+        return "𝔠"
+    if name == "chcy":
+        return "ч"
+    if name == "check":
+        return "✓"
+    if name == "checkmark":
+        return "✓"
+    if name == "chi":
+        return "χ"
+    if name == "cir":
+        return "○"
+    if name == "cirE":
+        return "⧃"
+    if name == "circ":
+        return "ˆ"
+    if name == "circeq":
+        return "≗"
+    if name == "circlearrowleft":
+        return "↺"
+    if name == "circlearrowright":
+        return "↻"
+    if name == "circledR":
+        return "®"
+    if name == "circledS":
+        return "Ⓢ"
+    if name == "circledast":
+        return "⊛"
+    if name == "circledcirc":
+        return "⊚"
+    if name == "circleddash":
+        return "⊝"
+    if name == "cire":
+        return "≗"
+    if name == "cirfnint":
+        return "⨐"
+    if name == "cirmid":
+        return "⫯"
+    if name == "cirscir":
+        return "⧂"
+    if name == "clubs":
+        return "♣"
+    if name == "clubsuit":
+        return "♣"
+    if name == "colon":
+        return ":"
+    if name == "colone":
+        return "≔"
+    if name == "coloneq":
+        return "≔"
+    if name == "comma":
+        return ","
+    if name == "commat":
+        return "@"
+    if name == "comp":
+        return "∁"
+    if name == "compfn":
+        return "∘"
+    if name == "complement":
+        return "∁"
+    if name == "complexes":
+        return "ℂ"
+    if name == "cong":
+        return "≅"
+    if name == "congdot":
+        return "⩭"
+    if name == "conint":
+        return "∮"
+    if name == "copf":
+        return "𝕔"
+    if name == "coprod":
+        return "∐"
     if name == "copy":
         return "©"
+    if name == "copysr":
+        return "℗"
+    if name == "crarr":
+        return "↵"
+    if name == "cross":
+        return "✗"
+    if name == "cscr":
+        return "𝒸"
+    if name == "csub":
+        return "⫏"
+    if name == "csube":
+        return "⫑"
+    if name == "csup":
+        return "⫐"
+    if name == "csupe":
+        return "⫒"
+    if name == "ctdot":
+        return "⋯"
+    if name == "cudarrl":
+        return "⤸"
+    if name == "cudarrr":
+        return "⤵"
+    if name == "cuepr":
+        return "⋞"
+    if name == "cuesc":
+        return "⋟"
+    if name == "cularr":
+        return "↶"
+    if name == "cularrp":
+        return "⤽"
+    if name == "cup":
+        return "∪"
+    if name == "cupbrcap":
+        return "⩈"
+    if name == "cupcap":
+        return "⩆"
+    if name == "cupcup":
+        return "⩊"
+    if name == "cupdot":
+        return "⊍"
+    if name == "cupor":
+        return "⩅"
+    if name == "cups":
+        return "∪︀"
+    if name == "curarr":
+        return "↷"
+    if name == "curarrm":
+        return "⤼"
+    if name == "curlyeqprec":
+        return "⋞"
+    if name == "curlyeqsucc":
+        return "⋟"
+    if name == "curlyvee":
+        return "⋎"
+    if name == "curlywedge":
+        return "⋏"
+    if name == "curren":
+        return "¤"
+    if name == "curvearrowleft":
+        return "↶"
+    if name == "curvearrowright":
+        return "↷"
+    if name == "cuvee":
+        return "⋎"
+    if name == "cuwed":
+        return "⋏"
+    if name == "cwconint":
+        return "∲"
+    if name == "cwint":
+        return "∱"
+    if name == "cylcty":
+        return "⌭"
+    if name == "dArr":
+        return "⇓"
+    if name == "dHar":
+        return "⥥"
     if name == "dagger":
         return "†"
+    if name == "daleth":
+        return "ℸ"
+    if name == "darr":
+        return "↓"
+    if name == "dash":
+        return "‐"
+    if name == "dashv":
+        return "⊣"
+    if name == "dbkarow":
+        return "⤏"
+    if name == "dblac":
+        return "˝"
+    if name == "dcaron":
+        return "ď"
+    if name == "dcy":
+        return "д"
+    if name == "dd":
+        return "ⅆ"
+    if name == "ddagger":
+        return "‡"
+    if name == "ddarr":
+        return "⇊"
+    if name == "ddotseq":
+        return "⩷"
     if name == "deg":
         return "°"
+    if name == "delta":
+        return "δ"
+    if name == "demptyv":
+        return "⦱"
+    if name == "dfisht":
+        return "⥿"
+    if name == "dfr":
+        return "𝔡"
+    if name == "dharl":
+        return "⇃"
+    if name == "dharr":
+        return "⇂"
+    if name == "diam":
+        return "⋄"
+    if name == "diamond":
+        return "⋄"
+    if name == "diamondsuit":
+        return "♦"
+    if name == "diams":
+        return "♦"
+    if name == "die":
+        return "¨"
+    if name == "digamma":
+        return "ϝ"
+    if name == "disin":
+        return "⋲"
+    if name == "div":
+        return "÷"
     if name == "divide":
         return "÷"
+    if name == "divideontimes":
+        return "⋇"
+    if name == "divonx":
+        return "⋇"
+    if name == "djcy":
+        return "ђ"
+    if name == "dlcorn":
+        return "⌞"
+    if name == "dlcrop":
+        return "⌍"
+    if name == "dollar":
+        return "$"
+    if name == "dopf":
+        return "𝕕"
+    if name == "dot":
+        return "˙"
+    if name == "doteq":
+        return "≐"
+    if name == "doteqdot":
+        return "≑"
+    if name == "dotminus":
+        return "∸"
+    if name == "dotplus":
+        return "∔"
+    if name == "dotsquare":
+        return "⊡"
+    if name == "doublebarwedge":
+        return "⌆"
+    if name == "downarrow":
+        return "↓"
+    if name == "downdownarrows":
+        return "⇊"
+    if name == "downharpoonleft":
+        return "⇃"
+    if name == "downharpoonright":
+        return "⇂"
+    if name == "drbkarow":
+        return "⤐"
+    if name == "drcorn":
+        return "⌟"
+    if name == "drcrop":
+        return "⌌"
+    if name == "dscr":
+        return "𝒹"
+    if name == "dscy":
+        return "ѕ"
+    if name == "dsol":
+        return "⧶"
+    if name == "dstrok":
+        return "đ"
+    if name == "dtdot":
+        return "⋱"
+    if name == "dtri":
+        return "▿"
+    if name == "dtrif":
+        return "▾"
+    if name == "duarr":
+        return "⇵"
+    if name == "duhar":
+        return "⥯"
+    if name == "dwangle":
+        return "⦦"
+    if name == "dzcy":
+        return "џ"
+    if name == "dzigrarr":
+        return "⟿"
+    if name == "eDDot":
+        return "⩷"
+    if name == "eDot":
+        return "≑"
+    if name == "eacute":
+        return "é"
+    if name == "easter":
+        return "⩮"
+    if name == "ecaron":
+        return "ě"
+    if name == "ecir":
+        return "≖"
+    if name == "ecirc":
+        return "ê"
+    if name == "ecolon":
+        return "≕"
+    if name == "ecy":
+        return "э"
+    if name == "edot":
+        return "ė"
+    if name == "ee":
+        return "ⅇ"
+    if name == "efDot":
+        return "≒"
+    if name == "efr":
+        return "𝔢"
+    if name == "eg":
+        return "⪚"
+    if name == "egrave":
+        return "è"
+    if name == "egs":
+        return "⪖"
+    if name == "egsdot":
+        return "⪘"
+    if name == "el":
+        return "⪙"
+    if name == "elinters":
+        return "⏧"
+    if name == "ell":
+        return "ℓ"
+    if name == "els":
+        return "⪕"
+    if name == "elsdot":
+        return "⪗"
+    if name == "emacr":
+        return "ē"
+    if name == "empty":
+        return "∅"
+    if name == "emptyset":
+        return "∅"
+    if name == "emptyv":
+        return "∅"
+    if name == "emsp":
+        return " "
+    if name == "emsp13":
+        return " "
+    if name == "emsp14":
+        return " "
+    if name == "eng":
+        return "ŋ"
+    if name == "ensp":
+        return " "
+    if name == "eogon":
+        return "ę"
+    if name == "eopf":
+        return "𝕖"
+    if name == "epar":
+        return "⋕"
+    if name == "eparsl":
+        return "⧣"
+    if name == "eplus":
+        return "⩱"
+    if name == "epsi":
+        return "ε"
+    if name == "epsilon":
+        return "ε"
+    if name == "epsiv":
+        return "ϵ"
+    if name == "eqcirc":
+        return "≖"
+    if name == "eqcolon":
+        return "≕"
+    if name == "eqsim":
+        return "≂"
+    if name == "eqslantgtr":
+        return "⪖"
+    if name == "eqslantless":
+        return "⪕"
+    if name == "equals":
+        return "="
+    if name == "equest":
+        return "≟"
+    if name == "equiv":
+        return "≡"
+    if name == "equivDD":
+        return "⩸"
+    if name == "eqvparsl":
+        return "⧥"
+    if name == "erDot":
+        return "≓"
+    if name == "erarr":
+        return "⥱"
+    if name == "escr":
+        return "ℯ"
+    if name == "esdot":
+        return "≐"
+    if name == "esim":
+        return "≂"
+    if name == "eta":
+        return "η"
+    if name == "eth":
+        return "ð"
+    if name == "euml":
+        return "ë"
+    if name == "euro":
+        return "€"
+    if name == "excl":
+        return "!"
+    if name == "exist":
+        return "∃"
+    if name == "expectation":
+        return "ℰ"
+    if name == "exponentiale":
+        return "ⅇ"
+    if name == "fallingdotseq":
+        return "≒"
+    if name == "fcy":
+        return "ф"
+    if name == "female":
+        return "♀"
+    if name == "ffilig":
+        return "ﬃ"
+    if name == "fflig":
+        return "ﬀ"
+    if name == "ffllig":
+        return "ﬄ"
+    if name == "ffr":
+        return "𝔣"
+    if name == "filig":
+        return "ﬁ"
+    if name == "fjlig":
+        return "fj"
+    if name == "flat":
+        return "♭"
+    if name == "fllig":
+        return "ﬂ"
+    if name == "fltns":
+        return "▱"
+    if name == "fnof":
+        return "ƒ"
+    if name == "fopf":
+        return "𝕗"
+    if name == "forall":
+        return "∀"
+    if name == "fork":
+        return "⋔"
+    if name == "forkv":
+        return "⫙"
+    if name == "fpartint":
+        return "⨍"
+    if name == "frac12":
+        return "½"
+    if name == "frac13":
+        return "⅓"
+    if name == "frac14":
+        return "¼"
+    if name == "frac15":
+        return "⅕"
+    if name == "frac16":
+        return "⅙"
+    if name == "frac18":
+        return "⅛"
+    if name == "frac23":
+        return "⅔"
+    if name == "frac25":
+        return "⅖"
+    if name == "frac34":
+        return "¾"
+    if name == "frac35":
+        return "⅗"
+    if name == "frac38":
+        return "⅜"
+    if name == "frac45":
+        return "⅘"
+    if name == "frac56":
+        return "⅚"
+    if name == "frac58":
+        return "⅝"
+    if name == "frac78":
+        return "⅞"
+    if name == "frasl":
+        return "⁄"
+    if name == "frown":
+        return "⌢"
+    if name == "fscr":
+        return "𝒻"
+    if name == "gE":
+        return "≧"
+    if name == "gEl":
+        return "⪌"
+    if name == "gacute":
+        return "ǵ"
+    if name == "gamma":
+        return "γ"
+    if name == "gammad":
+        return "ϝ"
+    if name == "gap":
+        return "⪆"
+    if name == "gbreve":
+        return "ğ"
+    if name == "gcirc":
+        return "ĝ"
+    if name == "gcy":
+        return "г"
+    if name == "gdot":
+        return "ġ"
+    if name == "ge":
+        return "≥"
+    if name == "gel":
+        return "⋛"
+    if name == "geq":
+        return "≥"
+    if name == "geqq":
+        return "≧"
+    if name == "geqslant":
+        return "⩾"
+    if name == "ges":
+        return "⩾"
+    if name == "gescc":
+        return "⪩"
+    if name == "gesdot":
+        return "⪀"
+    if name == "gesdoto":
+        return "⪂"
+    if name == "gesdotol":
+        return "⪄"
+    if name == "gesl":
+        return "⋛︀"
+    if name == "gesles":
+        return "⪔"
+    if name == "gfr":
+        return "𝔤"
+    if name == "gg":
+        return "≫"
+    if name == "ggg":
+        return "⋙"
+    if name == "gimel":
+        return "ℷ"
+    if name == "gjcy":
+        return "ѓ"
+    if name == "gl":
+        return "≷"
+    if name == "glE":
+        return "⪒"
+    if name == "gla":
+        return "⪥"
+    if name == "glj":
+        return "⪤"
+    if name == "gnE":
+        return "≩"
+    if name == "gnap":
+        return "⪊"
+    if name == "gnapprox":
+        return "⪊"
+    if name == "gne":
+        return "⪈"
+    if name == "gneq":
+        return "⪈"
+    if name == "gneqq":
+        return "≩"
+    if name == "gnsim":
+        return "⋧"
+    if name == "gopf":
+        return "𝕘"
+    if name == "grave":
+        return "`"
+    if name == "gscr":
+        return "ℊ"
+    if name == "gsim":
+        return "≳"
+    if name == "gsime":
+        return "⪎"
+    if name == "gsiml":
+        return "⪐"
     if name == "gt":
         return ">"
+    if name == "gtcc":
+        return "⪧"
+    if name == "gtcir":
+        return "⩺"
+    if name == "gtdot":
+        return "⋗"
+    if name == "gtlPar":
+        return "⦕"
+    if name == "gtquest":
+        return "⩼"
+    if name == "gtrapprox":
+        return "⪆"
+    if name == "gtrarr":
+        return "⥸"
+    if name == "gtrdot":
+        return "⋗"
+    if name == "gtreqless":
+        return "⋛"
+    if name == "gtreqqless":
+        return "⪌"
+    if name == "gtrless":
+        return "≷"
+    if name == "gtrsim":
+        return "≳"
+    if name == "gvertneqq":
+        return "≩︀"
+    if name == "gvnE":
+        return "≩︀"
+    if name == "hArr":
+        return "⇔"
+    if name == "hairsp":
+        return " "
+    if name == "half":
+        return "½"
+    if name == "hamilt":
+        return "ℋ"
+    if name == "hardcy":
+        return "ъ"
+    if name == "harr":
+        return "↔"
+    if name == "harrcir":
+        return "⥈"
+    if name == "harrw":
+        return "↭"
+    if name == "hbar":
+        return "ℏ"
+    if name == "hcirc":
+        return "ĥ"
+    if name == "hearts":
+        return "♥"
+    if name == "heartsuit":
+        return "♥"
     if name == "hellip":
         return "…"
+    if name == "hercon":
+        return "⊹"
+    if name == "hfr":
+        return "𝔥"
+    if name == "hksearow":
+        return "⤥"
+    if name == "hkswarow":
+        return "⤦"
+    if name == "hoarr":
+        return "⇿"
+    if name == "homtht":
+        return "∻"
+    if name == "hookleftarrow":
+        return "↩"
+    if name == "hookrightarrow":
+        return "↪"
+    if name == "hopf":
+        return "𝕙"
+    if name == "horbar":
+        return "―"
+    if name == "hscr":
+        return "𝒽"
+    if name == "hslash":
+        return "ℏ"
+    if name == "hstrok":
+        return "ħ"
+    if name == "hybull":
+        return "⁃"
+    if name == "hyphen":
+        return "‐"
+    if name == "iacute":
+        return "í"
+    if name == "ic":
+        return "⁣"
+    if name == "icirc":
+        return "î"
+    if name == "icy":
+        return "и"
+    if name == "iecy":
+        return "е"
+    if name == "iexcl":
+        return "¡"
+    if name == "iff":
+        return "⇔"
+    if name == "ifr":
+        return "𝔦"
+    if name == "igrave":
+        return "ì"
+    if name == "ii":
+        return "ⅈ"
+    if name == "iiiint":
+        return "⨌"
+    if name == "iiint":
+        return "∭"
+    if name == "iinfin":
+        return "⧜"
+    if name == "iiota":
+        return "℩"
+    if name == "ijlig":
+        return "ĳ"
+    if name == "imacr":
+        return "ī"
+    if name == "image":
+        return "ℑ"
+    if name == "imagline":
+        return "ℐ"
+    if name == "imagpart":
+        return "ℑ"
+    if name == "imath":
+        return "ı"
+    if name == "imof":
+        return "⊷"
+    if name == "imped":
+        return "Ƶ"
+    if name == "in":
+        return "∈"
+    if name == "incare":
+        return "℅"
+    if name == "infin":
+        return "∞"
+    if name == "infintie":
+        return "⧝"
+    if name == "inodot":
+        return "ı"
+    if name == "int":
+        return "∫"
+    if name == "intcal":
+        return "⊺"
+    if name == "integers":
+        return "ℤ"
+    if name == "intercal":
+        return "⊺"
+    if name == "intlarhk":
+        return "⨗"
+    if name == "intprod":
+        return "⨼"
+    if name == "iocy":
+        return "ё"
+    if name == "iogon":
+        return "į"
+    if name == "iopf":
+        return "𝕚"
+    if name == "iota":
+        return "ι"
+    if name == "iprod":
+        return "⨼"
+    if name == "iquest":
+        return "¿"
+    if name == "iscr":
+        return "𝒾"
+    if name == "isin":
+        return "∈"
+    if name == "isinE":
+        return "⋹"
+    if name == "isindot":
+        return "⋵"
+    if name == "isins":
+        return "⋴"
+    if name == "isinsv":
+        return "⋳"
+    if name == "isinv":
+        return "∈"
+    if name == "it":
+        return "⁢"
+    if name == "itilde":
+        return "ĩ"
+    if name == "iukcy":
+        return "і"
+    if name == "iuml":
+        return "ï"
+    if name == "jcirc":
+        return "ĵ"
+    if name == "jcy":
+        return "й"
+    if name == "jfr":
+        return "𝔧"
+    if name == "jmath":
+        return "ȷ"
+    if name == "jopf":
+        return "𝕛"
+    if name == "jscr":
+        return "𝒿"
+    if name == "jsercy":
+        return "ј"
+    if name == "jukcy":
+        return "є"
+    if name == "kappa":
+        return "κ"
+    if name == "kappav":
+        return "ϰ"
+    if name == "kcedil":
+        return "ķ"
+    if name == "kcy":
+        return "к"
+    if name == "kfr":
+        return "𝔨"
+    if name == "kgreen":
+        return "ĸ"
+    if name == "khcy":
+        return "х"
+    if name == "kjcy":
+        return "ќ"
+    if name == "kopf":
+        return "𝕜"
+    if name == "kscr":
+        return "𝓀"
+    if name == "lAarr":
+        return "⇚"
+    if name == "lArr":
+        return "⇐"
+    if name == "lAtail":
+        return "⤛"
+    if name == "lBarr":
+        return "⤎"
+    if name == "lE":
+        return "≦"
+    if name == "lEg":
+        return "⪋"
+    if name == "lHar":
+        return "⥢"
+    if name == "lacute":
+        return "ĺ"
+    if name == "laemptyv":
+        return "⦴"
+    if name == "lagran":
+        return "ℒ"
+    if name == "lambda":
+        return "λ"
+    if name == "lang":
+        return "⟨"
+    if name == "langd":
+        return "⦑"
+    if name == "langle":
+        return "⟨"
+    if name == "lap":
+        return "⪅"
     if name == "laquo":
         return "«"
+    if name == "larr":
+        return "←"
+    if name == "larrb":
+        return "⇤"
+    if name == "larrbfs":
+        return "⤟"
+    if name == "larrfs":
+        return "⤝"
+    if name == "larrhk":
+        return "↩"
+    if name == "larrlp":
+        return "↫"
+    if name == "larrpl":
+        return "⤹"
+    if name == "larrsim":
+        return "⥳"
+    if name == "larrtl":
+        return "↢"
+    if name == "lat":
+        return "⪫"
+    if name == "latail":
+        return "⤙"
+    if name == "late":
+        return "⪭"
+    if name == "lates":
+        return "⪭︀"
+    if name == "lbarr":
+        return "⤌"
+    if name == "lbbrk":
+        return "❲"
+    if name == "lbrace":
+        return "{"
+    if name == "lbrack":
+        return "["
+    if name == "lbrke":
+        return "⦋"
+    if name == "lbrksld":
+        return "⦏"
+    if name == "lbrkslu":
+        return "⦍"
+    if name == "lcaron":
+        return "ľ"
+    if name == "lcedil":
+        return "ļ"
+    if name == "lceil":
+        return "⌈"
+    if name == "lcub":
+        return "{"
+    if name == "lcy":
+        return "л"
+    if name == "ldca":
+        return "⤶"
     if name == "ldquo":
         return "“"
+    if name == "ldquor":
+        return "„"
+    if name == "ldrdhar":
+        return "⥧"
+    if name == "ldrushar":
+        return "⥋"
+    if name == "ldsh":
+        return "↲"
+    if name == "le":
+        return "≤"
+    if name == "leftarrow":
+        return "←"
+    if name == "leftarrowtail":
+        return "↢"
+    if name == "leftharpoondown":
+        return "↽"
+    if name == "leftharpoonup":
+        return "↼"
+    if name == "leftleftarrows":
+        return "⇇"
+    if name == "leftrightarrow":
+        return "↔"
+    if name == "leftrightarrows":
+        return "⇆"
+    if name == "leftrightharpoons":
+        return "⇋"
+    if name == "leftrightsquigarrow":
+        return "↭"
+    if name == "leftthreetimes":
+        return "⋋"
+    if name == "leg":
+        return "⋚"
+    if name == "leq":
+        return "≤"
+    if name == "leqq":
+        return "≦"
+    if name == "leqslant":
+        return "⩽"
+    if name == "les":
+        return "⩽"
+    if name == "lescc":
+        return "⪨"
+    if name == "lesdot":
+        return "⩿"
+    if name == "lesdoto":
+        return "⪁"
+    if name == "lesdotor":
+        return "⪃"
+    if name == "lesg":
+        return "⋚︀"
+    if name == "lesges":
+        return "⪓"
+    if name == "lessapprox":
+        return "⪅"
+    if name == "lessdot":
+        return "⋖"
+    if name == "lesseqgtr":
+        return "⋚"
+    if name == "lesseqqgtr":
+        return "⪋"
+    if name == "lessgtr":
+        return "≶"
+    if name == "lesssim":
+        return "≲"
+    if name == "lfisht":
+        return "⥼"
+    if name == "lfloor":
+        return "⌊"
+    if name == "lfr":
+        return "𝔩"
+    if name == "lg":
+        return "≶"
+    if name == "lgE":
+        return "⪑"
+    if name == "lhard":
+        return "↽"
+    if name == "lharu":
+        return "↼"
+    if name == "lharul":
+        return "⥪"
+    if name == "lhblk":
+        return "▄"
+    if name == "ljcy":
+        return "љ"
+    if name == "ll":
+        return "≪"
+    if name == "llarr":
+        return "⇇"
+    if name == "llcorner":
+        return "⌞"
+    if name == "llhard":
+        return "⥫"
+    if name == "lltri":
+        return "◺"
+    if name == "lmidot":
+        return "ŀ"
+    if name == "lmoust":
+        return "⎰"
+    if name == "lmoustache":
+        return "⎰"
+    if name == "lnE":
+        return "≨"
+    if name == "lnap":
+        return "⪉"
+    if name == "lnapprox":
+        return "⪉"
+    if name == "lne":
+        return "⪇"
+    if name == "lneq":
+        return "⪇"
+    if name == "lneqq":
+        return "≨"
+    if name == "lnsim":
+        return "⋦"
+    if name == "loang":
+        return "⟬"
+    if name == "loarr":
+        return "⇽"
+    if name == "lobrk":
+        return "⟦"
+    if name == "longleftarrow":
+        return "⟵"
+    if name == "longleftrightarrow":
+        return "⟷"
+    if name == "longmapsto":
+        return "⟼"
+    if name == "longrightarrow":
+        return "⟶"
+    if name == "looparrowleft":
+        return "↫"
+    if name == "looparrowright":
+        return "↬"
+    if name == "lopar":
+        return "⦅"
+    if name == "lopf":
+        return "𝕝"
+    if name == "loplus":
+        return "⨭"
+    if name == "lotimes":
+        return "⨴"
+    if name == "lowast":
+        return "∗"
+    if name == "lowbar":
+        return "_"
+    if name == "loz":
+        return "◊"
+    if name == "lozenge":
+        return "◊"
+    if name == "lozf":
+        return "⧫"
+    if name == "lpar":
+        return "("
+    if name == "lparlt":
+        return "⦓"
+    if name == "lrarr":
+        return "⇆"
+    if name == "lrcorner":
+        return "⌟"
+    if name == "lrhar":
+        return "⇋"
+    if name == "lrhard":
+        return "⥭"
+    if name == "lrm":
+        return "‎"
+    if name == "lrtri":
+        return "⊿"
+    if name == "lsaquo":
+        return "‹"
+    if name == "lscr":
+        return "𝓁"
+    if name == "lsh":
+        return "↰"
+    if name == "lsim":
+        return "≲"
+    if name == "lsime":
+        return "⪍"
+    if name == "lsimg":
+        return "⪏"
+    if name == "lsqb":
+        return "["
     if name == "lsquo":
         return "‘"
+    if name == "lsquor":
+        return "‚"
+    if name == "lstrok":
+        return "ł"
     if name == "lt":
         return "<"
+    if name == "ltcc":
+        return "⪦"
+    if name == "ltcir":
+        return "⩹"
+    if name == "ltdot":
+        return "⋖"
+    if name == "lthree":
+        return "⋋"
+    if name == "ltimes":
+        return "⋉"
+    if name == "ltlarr":
+        return "⥶"
+    if name == "ltquest":
+        return "⩻"
+    if name == "ltrPar":
+        return "⦖"
+    if name == "ltri":
+        return "◃"
+    if name == "ltrie":
+        return "⊴"
+    if name == "ltrif":
+        return "◂"
+    if name == "lurdshar":
+        return "⥊"
+    if name == "luruhar":
+        return "⥦"
+    if name == "lvertneqq":
+        return "≨︀"
+    if name == "lvnE":
+        return "≨︀"
+    if name == "mDDot":
+        return "∺"
+    if name == "macr":
+        return "¯"
+    if name == "male":
+        return "♂"
+    if name == "malt":
+        return "✠"
+    if name == "maltese":
+        return "✠"
+    if name == "map":
+        return "↦"
+    if name == "mapsto":
+        return "↦"
+    if name == "mapstodown":
+        return "↧"
+    if name == "mapstoleft":
+        return "↤"
+    if name == "mapstoup":
+        return "↥"
+    if name == "marker":
+        return "▮"
+    if name == "mcomma":
+        return "⨩"
+    if name == "mcy":
+        return "м"
     if name == "mdash":
         return "—"
+    if name == "measuredangle":
+        return "∡"
+    if name == "mfr":
+        return "𝔪"
+    if name == "mho":
+        return "℧"
     if name == "micro":
         return "µ"
+    if name == "mid":
+        return "∣"
+    if name == "midast":
+        return "*"
+    if name == "midcir":
+        return "⫰"
     if name == "middot":
         return "·"
+    if name == "minus":
+        return "−"
+    if name == "minusb":
+        return "⊟"
+    if name == "minusd":
+        return "∸"
+    if name == "minusdu":
+        return "⨪"
+    if name == "mlcp":
+        return "⫛"
+    if name == "mldr":
+        return "…"
+    if name == "mnplus":
+        return "∓"
+    if name == "models":
+        return "⊧"
+    if name == "mopf":
+        return "𝕞"
+    if name == "mp":
+        return "∓"
+    if name == "mscr":
+        return "𝓂"
+    if name == "mstpos":
+        return "∾"
+    if name == "mu":
+        return "μ"
+    if name == "multimap":
+        return "⊸"
+    if name == "mumap":
+        return "⊸"
+    if name == "nGg":
+        return "⋙̸"
+    if name == "nGt":
+        return "≫⃒"
+    if name == "nGtv":
+        return "≫̸"
+    if name == "nLeftarrow":
+        return "⇍"
+    if name == "nLeftrightarrow":
+        return "⇎"
+    if name == "nLl":
+        return "⋘̸"
+    if name == "nLt":
+        return "≪⃒"
+    if name == "nLtv":
+        return "≪̸"
+    if name == "nRightarrow":
+        return "⇏"
+    if name == "nVDash":
+        return "⊯"
+    if name == "nVdash":
+        return "⊮"
+    if name == "nabla":
+        return "∇"
+    if name == "nacute":
+        return "ń"
+    if name == "nang":
+        return "∠⃒"
+    if name == "nap":
+        return "≉"
+    if name == "napE":
+        return "⩰̸"
+    if name == "napid":
+        return "≋̸"
+    if name == "napos":
+        return "ŉ"
+    if name == "napprox":
+        return "≉"
+    if name == "natur":
+        return "♮"
+    if name == "natural":
+        return "♮"
+    if name == "naturals":
+        return "ℕ"
     if name == "nbsp":
         return " "
+    if name == "nbump":
+        return "≎̸"
+    if name == "nbumpe":
+        return "≏̸"
+    if name == "ncap":
+        return "⩃"
+    if name == "ncaron":
+        return "ň"
+    if name == "ncedil":
+        return "ņ"
+    if name == "ncong":
+        return "≇"
+    if name == "ncongdot":
+        return "⩭̸"
+    if name == "ncup":
+        return "⩂"
+    if name == "ncy":
+        return "н"
     if name == "ndash":
         return "–"
+    if name == "ne":
+        return "≠"
+    if name == "neArr":
+        return "⇗"
+    if name == "nearhk":
+        return "⤤"
+    if name == "nearr":
+        return "↗"
+    if name == "nearrow":
+        return "↗"
+    if name == "nedot":
+        return "≐̸"
+    if name == "nequiv":
+        return "≢"
+    if name == "nesear":
+        return "⤨"
+    if name == "nesim":
+        return "≂̸"
+    if name == "nexist":
+        return "∄"
+    if name == "nexists":
+        return "∄"
+    if name == "nfr":
+        return "𝔫"
+    if name == "ngE":
+        return "≧̸"
+    if name == "nge":
+        return "≱"
+    if name == "ngeq":
+        return "≱"
+    if name == "ngeqq":
+        return "≧̸"
+    if name == "ngeqslant":
+        return "⩾̸"
+    if name == "nges":
+        return "⩾̸"
+    if name == "ngsim":
+        return "≵"
+    if name == "ngt":
+        return "≯"
+    if name == "ngtr":
+        return "≯"
+    if name == "nhArr":
+        return "⇎"
+    if name == "nharr":
+        return "↮"
+    if name == "nhpar":
+        return "⫲"
+    if name == "ni":
+        return "∋"
+    if name == "nis":
+        return "⋼"
+    if name == "nisd":
+        return "⋺"
+    if name == "niv":
+        return "∋"
+    if name == "njcy":
+        return "њ"
+    if name == "nlArr":
+        return "⇍"
+    if name == "nlE":
+        return "≦̸"
+    if name == "nlarr":
+        return "↚"
+    if name == "nldr":
+        return "‥"
+    if name == "nle":
+        return "≰"
+    if name == "nleftarrow":
+        return "↚"
+    if name == "nleftrightarrow":
+        return "↮"
+    if name == "nleq":
+        return "≰"
+    if name == "nleqq":
+        return "≦̸"
+    if name == "nleqslant":
+        return "⩽̸"
+    if name == "nles":
+        return "⩽̸"
+    if name == "nless":
+        return "≮"
+    if name == "nlsim":
+        return "≴"
+    if name == "nlt":
+        return "≮"
+    if name == "nltri":
+        return "⋪"
+    if name == "nltrie":
+        return "⋬"
+    if name == "nmid":
+        return "∤"
+    if name == "nopf":
+        return "𝕟"
+    if name == "not":
+        return "¬"
+    if name == "notin":
+        return "∉"
+    if name == "notinE":
+        return "⋹̸"
+    if name == "notindot":
+        return "⋵̸"
+    if name == "notinva":
+        return "∉"
+    if name == "notinvb":
+        return "⋷"
+    if name == "notinvc":
+        return "⋶"
+    if name == "notni":
+        return "∌"
+    if name == "notniva":
+        return "∌"
+    if name == "notnivb":
+        return "⋾"
+    if name == "notnivc":
+        return "⋽"
+    if name == "npar":
+        return "∦"
+    if name == "nparallel":
+        return "∦"
+    if name == "nparsl":
+        return "⫽⃥"
+    if name == "npart":
+        return "∂̸"
+    if name == "npolint":
+        return "⨔"
+    if name == "npr":
+        return "⊀"
+    if name == "nprcue":
+        return "⋠"
+    if name == "npre":
+        return "⪯̸"
+    if name == "nprec":
+        return "⊀"
+    if name == "npreceq":
+        return "⪯̸"
+    if name == "nrArr":
+        return "⇏"
+    if name == "nrarr":
+        return "↛"
+    if name == "nrarrc":
+        return "⤳̸"
+    if name == "nrarrw":
+        return "↝̸"
+    if name == "nrightarrow":
+        return "↛"
+    if name == "nrtri":
+        return "⋫"
+    if name == "nrtrie":
+        return "⋭"
+    if name == "nsc":
+        return "⊁"
+    if name == "nsccue":
+        return "⋡"
+    if name == "nsce":
+        return "⪰̸"
+    if name == "nscr":
+        return "𝓃"
+    if name == "nshortmid":
+        return "∤"
+    if name == "nshortparallel":
+        return "∦"
+    if name == "nsim":
+        return "≁"
+    if name == "nsime":
+        return "≄"
+    if name == "nsimeq":
+        return "≄"
+    if name == "nsmid":
+        return "∤"
+    if name == "nspar":
+        return "∦"
+    if name == "nsqsube":
+        return "⋢"
+    if name == "nsqsupe":
+        return "⋣"
+    if name == "nsub":
+        return "⊄"
+    if name == "nsubE":
+        return "⫅̸"
+    if name == "nsube":
+        return "⊈"
+    if name == "nsubset":
+        return "⊂⃒"
+    if name == "nsubseteq":
+        return "⊈"
+    if name == "nsubseteqq":
+        return "⫅̸"
+    if name == "nsucc":
+        return "⊁"
+    if name == "nsucceq":
+        return "⪰̸"
+    if name == "nsup":
+        return "⊅"
+    if name == "nsupE":
+        return "⫆̸"
+    if name == "nsupe":
+        return "⊉"
+    if name == "nsupset":
+        return "⊃⃒"
+    if name == "nsupseteq":
+        return "⊉"
+    if name == "nsupseteqq":
+        return "⫆̸"
+    if name == "ntgl":
+        return "≹"
+    if name == "ntilde":
+        return "ñ"
+    if name == "ntlg":
+        return "≸"
+    if name == "ntriangleleft":
+        return "⋪"
+    if name == "ntrianglelefteq":
+        return "⋬"
+    if name == "ntriangleright":
+        return "⋫"
+    if name == "ntrianglerighteq":
+        return "⋭"
+    if name == "nu":
+        return "ν"
+    if name == "num":
+        return "#"
+    if name == "numero":
+        return "№"
+    if name == "numsp":
+        return " "
+    if name == "nvDash":
+        return "⊭"
+    if name == "nvHarr":
+        return "⤄"
+    if name == "nvap":
+        return "≍⃒"
+    if name == "nvdash":
+        return "⊬"
+    if name == "nvge":
+        return "≥⃒"
+    if name == "nvgt":
+        return ">⃒"
+    if name == "nvinfin":
+        return "⧞"
+    if name == "nvlArr":
+        return "⤂"
+    if name == "nvle":
+        return "≤⃒"
+    if name == "nvlt":
+        return "<⃒"
+    if name == "nvltrie":
+        return "⊴⃒"
+    if name == "nvrArr":
+        return "⤃"
+    if name == "nvrtrie":
+        return "⊵⃒"
+    if name == "nvsim":
+        return "∼⃒"
+    if name == "nwArr":
+        return "⇖"
+    if name == "nwarhk":
+        return "⤣"
+    if name == "nwarr":
+        return "↖"
+    if name == "nwarrow":
+        return "↖"
+    if name == "nwnear":
+        return "⤧"
+    if name == "oS":
+        return "Ⓢ"
+    if name == "oacute":
+        return "ó"
+    if name == "oast":
+        return "⊛"
+    if name == "ocir":
+        return "⊚"
+    if name == "ocirc":
+        return "ô"
+    if name == "ocy":
+        return "о"
+    if name == "odash":
+        return "⊝"
+    if name == "odblac":
+        return "ő"
+    if name == "odiv":
+        return "⨸"
+    if name == "odot":
+        return "⊙"
+    if name == "odsold":
+        return "⦼"
+    if name == "oelig":
+        return "œ"
+    if name == "ofcir":
+        return "⦿"
+    if name == "ofr":
+        return "𝔬"
+    if name == "ogon":
+        return "˛"
+    if name == "ograve":
+        return "ò"
+    if name == "ogt":
+        return "⧁"
+    if name == "ohbar":
+        return "⦵"
+    if name == "ohm":
+        return "Ω"
+    if name == "oint":
+        return "∮"
+    if name == "olarr":
+        return "↺"
+    if name == "olcir":
+        return "⦾"
+    if name == "olcross":
+        return "⦻"
+    if name == "oline":
+        return "‾"
+    if name == "olt":
+        return "⧀"
+    if name == "omacr":
+        return "ō"
+    if name == "omega":
+        return "ω"
+    if name == "omicron":
+        return "ο"
+    if name == "omid":
+        return "⦶"
+    if name == "ominus":
+        return "⊖"
+    if name == "oopf":
+        return "𝕠"
+    if name == "opar":
+        return "⦷"
+    if name == "operp":
+        return "⦹"
+    if name == "oplus":
+        return "⊕"
+    if name == "or":
+        return "∨"
+    if name == "orarr":
+        return "↻"
+    if name == "ord":
+        return "⩝"
+    if name == "order":
+        return "ℴ"
+    if name == "orderof":
+        return "ℴ"
+    if name == "ordf":
+        return "ª"
+    if name == "ordm":
+        return "º"
+    if name == "origof":
+        return "⊶"
+    if name == "oror":
+        return "⩖"
+    if name == "orslope":
+        return "⩗"
+    if name == "orv":
+        return "⩛"
+    if name == "oscr":
+        return "ℴ"
+    if name == "oslash":
+        return "ø"
+    if name == "osol":
+        return "⊘"
+    if name == "otilde":
+        return "õ"
+    if name == "otimes":
+        return "⊗"
+    if name == "otimesas":
+        return "⨶"
+    if name == "ouml":
+        return "ö"
+    if name == "ovbar":
+        return "⌽"
+    if name == "par":
+        return "∥"
     if name == "para":
         return "¶"
+    if name == "parallel":
+        return "∥"
+    if name == "parsim":
+        return "⫳"
+    if name == "parsl":
+        return "⫽"
+    if name == "part":
+        return "∂"
+    if name == "pcy":
+        return "п"
+    if name == "percnt":
+        return "%"
+    if name == "period":
+        return "."
+    if name == "permil":
+        return "‰"
+    if name == "perp":
+        return "⊥"
+    if name == "pertenk":
+        return "‱"
+    if name == "pfr":
+        return "𝔭"
+    if name == "phi":
+        return "φ"
+    if name == "phiv":
+        return "ϕ"
+    if name == "phmmat":
+        return "ℳ"
+    if name == "phone":
+        return "☎"
+    if name == "pi":
+        return "π"
+    if name == "pitchfork":
+        return "⋔"
+    if name == "piv":
+        return "ϖ"
+    if name == "planck":
+        return "ℏ"
+    if name == "planckh":
+        return "ℎ"
+    if name == "plankv":
+        return "ℏ"
+    if name == "plus":
+        return "+"
+    if name == "plusacir":
+        return "⨣"
+    if name == "plusb":
+        return "⊞"
+    if name == "pluscir":
+        return "⨢"
+    if name == "plusdo":
+        return "∔"
+    if name == "plusdu":
+        return "⨥"
+    if name == "pluse":
+        return "⩲"
     if name == "plusmn":
         return "±"
+    if name == "plussim":
+        return "⨦"
+    if name == "plustwo":
+        return "⨧"
+    if name == "pm":
+        return "±"
+    if name == "pointint":
+        return "⨕"
+    if name == "popf":
+        return "𝕡"
+    if name == "pound":
+        return "£"
+    if name == "pr":
+        return "≺"
+    if name == "prE":
+        return "⪳"
+    if name == "prap":
+        return "⪷"
+    if name == "prcue":
+        return "≼"
+    if name == "pre":
+        return "⪯"
+    if name == "prec":
+        return "≺"
+    if name == "precapprox":
+        return "⪷"
+    if name == "preccurlyeq":
+        return "≼"
+    if name == "preceq":
+        return "⪯"
+    if name == "precnapprox":
+        return "⪹"
+    if name == "precneqq":
+        return "⪵"
+    if name == "precnsim":
+        return "⋨"
+    if name == "precsim":
+        return "≾"
+    if name == "prime":
+        return "′"
+    if name == "primes":
+        return "ℙ"
+    if name == "prnE":
+        return "⪵"
+    if name == "prnap":
+        return "⪹"
+    if name == "prnsim":
+        return "⋨"
+    if name == "prod":
+        return "∏"
+    if name == "profalar":
+        return "⌮"
+    if name == "profline":
+        return "⌒"
+    if name == "profsurf":
+        return "⌓"
+    if name == "prop":
+        return "∝"
+    if name == "propto":
+        return "∝"
+    if name == "prsim":
+        return "≾"
+    if name == "prurel":
+        return "⊰"
+    if name == "pscr":
+        return "𝓅"
+    if name == "psi":
+        return "ψ"
+    if name == "puncsp":
+        return " "
+    if name == "qfr":
+        return "𝔮"
+    if name == "qint":
+        return "⨌"
+    if name == "qopf":
+        return "𝕢"
+    if name == "qprime":
+        return "⁗"
+    if name == "qscr":
+        return "𝓆"
+    if name == "quaternions":
+        return "ℍ"
+    if name == "quatint":
+        return "⨖"
+    if name == "quest":
+        return "?"
+    if name == "questeq":
+        return "≟"
     if name == "quot":
-        return '"'
+        return "\""
+    if name == "rAarr":
+        return "⇛"
+    if name == "rArr":
+        return "⇒"
+    if name == "rAtail":
+        return "⤜"
+    if name == "rBarr":
+        return "⤏"
+    if name == "rHar":
+        return "⥤"
+    if name == "race":
+        return "∽̱"
+    if name == "racute":
+        return "ŕ"
+    if name == "radic":
+        return "√"
+    if name == "raemptyv":
+        return "⦳"
+    if name == "rang":
+        return "⟩"
+    if name == "rangd":
+        return "⦒"
+    if name == "range":
+        return "⦥"
+    if name == "rangle":
+        return "⟩"
     if name == "raquo":
         return "»"
+    if name == "rarr":
+        return "→"
+    if name == "rarrap":
+        return "⥵"
+    if name == "rarrb":
+        return "⇥"
+    if name == "rarrbfs":
+        return "⤠"
+    if name == "rarrc":
+        return "⤳"
+    if name == "rarrfs":
+        return "⤞"
+    if name == "rarrhk":
+        return "↪"
+    if name == "rarrlp":
+        return "↬"
+    if name == "rarrpl":
+        return "⥅"
+    if name == "rarrsim":
+        return "⥴"
+    if name == "rarrtl":
+        return "↣"
+    if name == "rarrw":
+        return "↝"
+    if name == "ratail":
+        return "⤚"
+    if name == "ratio":
+        return "∶"
+    if name == "rationals":
+        return "ℚ"
+    if name == "rbarr":
+        return "⤍"
+    if name == "rbbrk":
+        return "❳"
+    if name == "rbrace":
+        return "}"
+    if name == "rbrack":
+        return "]"
+    if name == "rbrke":
+        return "⦌"
+    if name == "rbrksld":
+        return "⦎"
+    if name == "rbrkslu":
+        return "⦐"
+    if name == "rcaron":
+        return "ř"
+    if name == "rcedil":
+        return "ŗ"
+    if name == "rceil":
+        return "⌉"
+    if name == "rcub":
+        return "}"
+    if name == "rcy":
+        return "р"
+    if name == "rdca":
+        return "⤷"
+    if name == "rdldhar":
+        return "⥩"
     if name == "rdquo":
         return "”"
+    if name == "rdquor":
+        return "”"
+    if name == "rdsh":
+        return "↳"
+    if name == "real":
+        return "ℜ"
+    if name == "realine":
+        return "ℛ"
+    if name == "realpart":
+        return "ℜ"
+    if name == "reals":
+        return "ℝ"
+    if name == "rect":
+        return "▭"
     if name == "reg":
         return "®"
+    if name == "rfisht":
+        return "⥽"
+    if name == "rfloor":
+        return "⌋"
+    if name == "rfr":
+        return "𝔯"
+    if name == "rhard":
+        return "⇁"
+    if name == "rharu":
+        return "⇀"
+    if name == "rharul":
+        return "⥬"
+    if name == "rho":
+        return "ρ"
+    if name == "rhov":
+        return "ϱ"
+    if name == "rightarrow":
+        return "→"
+    if name == "rightarrowtail":
+        return "↣"
+    if name == "rightharpoondown":
+        return "⇁"
+    if name == "rightharpoonup":
+        return "⇀"
+    if name == "rightleftarrows":
+        return "⇄"
+    if name == "rightleftharpoons":
+        return "⇌"
+    if name == "rightrightarrows":
+        return "⇉"
+    if name == "rightsquigarrow":
+        return "↝"
+    if name == "rightthreetimes":
+        return "⋌"
+    if name == "ring":
+        return "˚"
+    if name == "risingdotseq":
+        return "≓"
+    if name == "rlarr":
+        return "⇄"
+    if name == "rlhar":
+        return "⇌"
+    if name == "rlm":
+        return "‏"
+    if name == "rmoust":
+        return "⎱"
+    if name == "rmoustache":
+        return "⎱"
+    if name == "rnmid":
+        return "⫮"
+    if name == "roang":
+        return "⟭"
+    if name == "roarr":
+        return "⇾"
+    if name == "robrk":
+        return "⟧"
+    if name == "ropar":
+        return "⦆"
+    if name == "ropf":
+        return "𝕣"
+    if name == "roplus":
+        return "⨮"
+    if name == "rotimes":
+        return "⨵"
+    if name == "rpar":
+        return ")"
+    if name == "rpargt":
+        return "⦔"
+    if name == "rppolint":
+        return "⨒"
+    if name == "rrarr":
+        return "⇉"
+    if name == "rsaquo":
+        return "›"
+    if name == "rscr":
+        return "𝓇"
+    if name == "rsh":
+        return "↱"
+    if name == "rsqb":
+        return "]"
     if name == "rsquo":
         return "’"
+    if name == "rsquor":
+        return "’"
+    if name == "rthree":
+        return "⋌"
+    if name == "rtimes":
+        return "⋊"
+    if name == "rtri":
+        return "▹"
+    if name == "rtrie":
+        return "⊵"
+    if name == "rtrif":
+        return "▸"
+    if name == "rtriltri":
+        return "⧎"
+    if name == "ruluhar":
+        return "⥨"
+    if name == "rx":
+        return "℞"
+    if name == "sacute":
+        return "ś"
+    if name == "sbquo":
+        return "‚"
+    if name == "sc":
+        return "≻"
+    if name == "scE":
+        return "⪴"
+    if name == "scap":
+        return "⪸"
+    if name == "scaron":
+        return "š"
+    if name == "sccue":
+        return "≽"
+    if name == "sce":
+        return "⪰"
+    if name == "scedil":
+        return "ş"
+    if name == "scirc":
+        return "ŝ"
+    if name == "scnE":
+        return "⪶"
+    if name == "scnap":
+        return "⪺"
+    if name == "scnsim":
+        return "⋩"
+    if name == "scpolint":
+        return "⨓"
+    if name == "scsim":
+        return "≿"
+    if name == "scy":
+        return "с"
+    if name == "sdot":
+        return "⋅"
+    if name == "sdotb":
+        return "⊡"
+    if name == "sdote":
+        return "⩦"
+    if name == "seArr":
+        return "⇘"
+    if name == "searhk":
+        return "⤥"
+    if name == "searr":
+        return "↘"
+    if name == "searrow":
+        return "↘"
     if name == "sect":
         return "§"
+    if name == "semi":
+        return ";"
+    if name == "seswar":
+        return "⤩"
+    if name == "setminus":
+        return "∖"
+    if name == "setmn":
+        return "∖"
+    if name == "sext":
+        return "✶"
+    if name == "sfr":
+        return "𝔰"
+    if name == "sfrown":
+        return "⌢"
+    if name == "sharp":
+        return "♯"
+    if name == "shchcy":
+        return "щ"
+    if name == "shcy":
+        return "ш"
+    if name == "shortmid":
+        return "∣"
+    if name == "shortparallel":
+        return "∥"
+    if name == "shy":
+        return "­"
+    if name == "sigma":
+        return "σ"
+    if name == "sigmaf":
+        return "ς"
+    if name == "sigmav":
+        return "ς"
+    if name == "sim":
+        return "∼"
+    if name == "simdot":
+        return "⩪"
+    if name == "sime":
+        return "≃"
+    if name == "simeq":
+        return "≃"
+    if name == "simg":
+        return "⪞"
+    if name == "simgE":
+        return "⪠"
+    if name == "siml":
+        return "⪝"
+    if name == "simlE":
+        return "⪟"
+    if name == "simne":
+        return "≆"
+    if name == "simplus":
+        return "⨤"
+    if name == "simrarr":
+        return "⥲"
+    if name == "slarr":
+        return "←"
+    if name == "smallsetminus":
+        return "∖"
+    if name == "smashp":
+        return "⨳"
+    if name == "smeparsl":
+        return "⧤"
+    if name == "smid":
+        return "∣"
+    if name == "smile":
+        return "⌣"
+    if name == "smt":
+        return "⪪"
+    if name == "smte":
+        return "⪬"
+    if name == "smtes":
+        return "⪬︀"
+    if name == "softcy":
+        return "ь"
+    if name == "sol":
+        return "/"
+    if name == "solb":
+        return "⧄"
+    if name == "solbar":
+        return "⌿"
+    if name == "sopf":
+        return "𝕤"
+    if name == "spades":
+        return "♠"
+    if name == "spadesuit":
+        return "♠"
+    if name == "spar":
+        return "∥"
+    if name == "sqcap":
+        return "⊓"
+    if name == "sqcaps":
+        return "⊓︀"
+    if name == "sqcup":
+        return "⊔"
+    if name == "sqcups":
+        return "⊔︀"
+    if name == "sqsub":
+        return "⊏"
+    if name == "sqsube":
+        return "⊑"
+    if name == "sqsubset":
+        return "⊏"
+    if name == "sqsubseteq":
+        return "⊑"
+    if name == "sqsup":
+        return "⊐"
+    if name == "sqsupe":
+        return "⊒"
+    if name == "sqsupset":
+        return "⊐"
+    if name == "sqsupseteq":
+        return "⊒"
+    if name == "squ":
+        return "□"
+    if name == "square":
+        return "□"
+    if name == "squarf":
+        return "▪"
+    if name == "squf":
+        return "▪"
+    if name == "srarr":
+        return "→"
+    if name == "sscr":
+        return "𝓈"
+    if name == "ssetmn":
+        return "∖"
+    if name == "ssmile":
+        return "⌣"
+    if name == "sstarf":
+        return "⋆"
+    if name == "star":
+        return "☆"
+    if name == "starf":
+        return "★"
+    if name == "straightepsilon":
+        return "ϵ"
+    if name == "straightphi":
+        return "ϕ"
+    if name == "strns":
+        return "¯"
+    if name == "sub":
+        return "⊂"
+    if name == "subE":
+        return "⫅"
+    if name == "subdot":
+        return "⪽"
+    if name == "sube":
+        return "⊆"
+    if name == "subedot":
+        return "⫃"
+    if name == "submult":
+        return "⫁"
+    if name == "subnE":
+        return "⫋"
+    if name == "subne":
+        return "⊊"
+    if name == "subplus":
+        return "⪿"
+    if name == "subrarr":
+        return "⥹"
+    if name == "subset":
+        return "⊂"
+    if name == "subseteq":
+        return "⊆"
+    if name == "subseteqq":
+        return "⫅"
+    if name == "subsetneq":
+        return "⊊"
+    if name == "subsetneqq":
+        return "⫋"
+    if name == "subsim":
+        return "⫇"
+    if name == "subsub":
+        return "⫕"
+    if name == "subsup":
+        return "⫓"
+    if name == "succ":
+        return "≻"
+    if name == "succapprox":
+        return "⪸"
+    if name == "succcurlyeq":
+        return "≽"
+    if name == "succeq":
+        return "⪰"
+    if name == "succnapprox":
+        return "⪺"
+    if name == "succneqq":
+        return "⪶"
+    if name == "succnsim":
+        return "⋩"
+    if name == "succsim":
+        return "≿"
+    if name == "sum":
+        return "∑"
+    if name == "sung":
+        return "♪"
+    if name == "sup":
+        return "⊃"
+    if name == "sup1":
+        return "¹"
+    if name == "sup2":
+        return "²"
+    if name == "sup3":
+        return "³"
+    if name == "supE":
+        return "⫆"
+    if name == "supdot":
+        return "⪾"
+    if name == "supdsub":
+        return "⫘"
+    if name == "supe":
+        return "⊇"
+    if name == "supedot":
+        return "⫄"
+    if name == "suphsol":
+        return "⟉"
+    if name == "suphsub":
+        return "⫗"
+    if name == "suplarr":
+        return "⥻"
+    if name == "supmult":
+        return "⫂"
+    if name == "supnE":
+        return "⫌"
+    if name == "supne":
+        return "⊋"
+    if name == "supplus":
+        return "⫀"
+    if name == "supset":
+        return "⊃"
+    if name == "supseteq":
+        return "⊇"
+    if name == "supseteqq":
+        return "⫆"
+    if name == "supsetneq":
+        return "⊋"
+    if name == "supsetneqq":
+        return "⫌"
+    if name == "supsim":
+        return "⫈"
+    if name == "supsub":
+        return "⫔"
+    if name == "supsup":
+        return "⫖"
+    if name == "swArr":
+        return "⇙"
+    if name == "swarhk":
+        return "⤦"
+    if name == "swarr":
+        return "↙"
+    if name == "swarrow":
+        return "↙"
+    if name == "swnwar":
+        return "⤪"
+    if name == "szlig":
+        return "ß"
+    if name == "target":
+        return "⌖"
+    if name == "tau":
+        return "τ"
+    if name == "tbrk":
+        return "⎴"
+    if name == "tcaron":
+        return "ť"
+    if name == "tcedil":
+        return "ţ"
+    if name == "tcy":
+        return "т"
+    if name == "tdot":
+        return "⃛"
+    if name == "telrec":
+        return "⌕"
+    if name == "tfr":
+        return "𝔱"
+    if name == "there4":
+        return "∴"
+    if name == "therefore":
+        return "∴"
+    if name == "theta":
+        return "θ"
+    if name == "thetasym":
+        return "ϑ"
+    if name == "thetav":
+        return "ϑ"
+    if name == "thickapprox":
+        return "≈"
+    if name == "thicksim":
+        return "∼"
+    if name == "thinsp":
+        return " "
+    if name == "thkap":
+        return "≈"
+    if name == "thksim":
+        return "∼"
+    if name == "thorn":
+        return "þ"
+    if name == "tilde":
+        return "˜"
     if name == "times":
         return "×"
+    if name == "timesb":
+        return "⊠"
+    if name == "timesbar":
+        return "⨱"
+    if name == "timesd":
+        return "⨰"
+    if name == "tint":
+        return "∭"
+    if name == "toea":
+        return "⤨"
+    if name == "top":
+        return "⊤"
+    if name == "topbot":
+        return "⌶"
+    if name == "topcir":
+        return "⫱"
+    if name == "topf":
+        return "𝕥"
+    if name == "topfork":
+        return "⫚"
+    if name == "tosa":
+        return "⤩"
+    if name == "tprime":
+        return "‴"
     if name == "trade":
         return "™"
-    return String()
+    if name == "triangle":
+        return "▵"
+    if name == "triangledown":
+        return "▿"
+    if name == "triangleleft":
+        return "◃"
+    if name == "trianglelefteq":
+        return "⊴"
+    if name == "triangleq":
+        return "≜"
+    if name == "triangleright":
+        return "▹"
+    if name == "trianglerighteq":
+        return "⊵"
+    if name == "tridot":
+        return "◬"
+    if name == "trie":
+        return "≜"
+    if name == "triminus":
+        return "⨺"
+    if name == "triplus":
+        return "⨹"
+    if name == "trisb":
+        return "⧍"
+    if name == "tritime":
+        return "⨻"
+    if name == "trpezium":
+        return "⏢"
+    if name == "tscr":
+        return "𝓉"
+    if name == "tscy":
+        return "ц"
+    if name == "tshcy":
+        return "ћ"
+    if name == "tstrok":
+        return "ŧ"
+    if name == "twixt":
+        return "≬"
+    if name == "twoheadleftarrow":
+        return "↞"
+    if name == "twoheadrightarrow":
+        return "↠"
+    if name == "uArr":
+        return "⇑"
+    if name == "uHar":
+        return "⥣"
+    if name == "uacute":
+        return "ú"
+    if name == "uarr":
+        return "↑"
+    if name == "ubrcy":
+        return "ў"
+    if name == "ubreve":
+        return "ŭ"
+    if name == "ucirc":
+        return "û"
+    if name == "ucy":
+        return "у"
+    if name == "udarr":
+        return "⇅"
+    if name == "udblac":
+        return "ű"
+    if name == "udhar":
+        return "⥮"
+    if name == "ufisht":
+        return "⥾"
+    if name == "ufr":
+        return "𝔲"
+    if name == "ugrave":
+        return "ù"
+    if name == "uharl":
+        return "↿"
+    if name == "uharr":
+        return "↾"
+    if name == "uhblk":
+        return "▀"
+    if name == "ulcorn":
+        return "⌜"
+    if name == "ulcorner":
+        return "⌜"
+    if name == "ulcrop":
+        return "⌏"
+    if name == "ultri":
+        return "◸"
+    if name == "umacr":
+        return "ū"
+    if name == "uml":
+        return "¨"
+    if name == "uogon":
+        return "ų"
+    if name == "uopf":
+        return "𝕦"
+    if name == "uparrow":
+        return "↑"
+    if name == "updownarrow":
+        return "↕"
+    if name == "upharpoonleft":
+        return "↿"
+    if name == "upharpoonright":
+        return "↾"
+    if name == "uplus":
+        return "⊎"
+    if name == "upsi":
+        return "υ"
+    if name == "upsih":
+        return "ϒ"
+    if name == "upsilon":
+        return "υ"
+    if name == "upuparrows":
+        return "⇈"
+    if name == "urcorn":
+        return "⌝"
+    if name == "urcorner":
+        return "⌝"
+    if name == "urcrop":
+        return "⌎"
+    if name == "uring":
+        return "ů"
+    if name == "urtri":
+        return "◹"
+    if name == "uscr":
+        return "𝓊"
+    if name == "utdot":
+        return "⋰"
+    if name == "utilde":
+        return "ũ"
+    if name == "utri":
+        return "▵"
+    if name == "utrif":
+        return "▴"
+    if name == "uuarr":
+        return "⇈"
+    if name == "uuml":
+        return "ü"
+    if name == "uwangle":
+        return "⦧"
+    if name == "vArr":
+        return "⇕"
+    if name == "vBar":
+        return "⫨"
+    if name == "vBarv":
+        return "⫩"
+    if name == "vDash":
+        return "⊨"
+    if name == "vangrt":
+        return "⦜"
+    if name == "varepsilon":
+        return "ϵ"
+    if name == "varkappa":
+        return "ϰ"
+    if name == "varnothing":
+        return "∅"
+    if name == "varphi":
+        return "ϕ"
+    if name == "varpi":
+        return "ϖ"
+    if name == "varpropto":
+        return "∝"
+    if name == "varr":
+        return "↕"
+    if name == "varrho":
+        return "ϱ"
+    if name == "varsigma":
+        return "ς"
+    if name == "varsubsetneq":
+        return "⊊︀"
+    if name == "varsubsetneqq":
+        return "⫋︀"
+    if name == "varsupsetneq":
+        return "⊋︀"
+    if name == "varsupsetneqq":
+        return "⫌︀"
+    if name == "vartheta":
+        return "ϑ"
+    if name == "vartriangleleft":
+        return "⊲"
+    if name == "vartriangleright":
+        return "⊳"
+    if name == "vcy":
+        return "в"
+    if name == "vdash":
+        return "⊢"
+    if name == "vee":
+        return "∨"
+    if name == "veebar":
+        return "⊻"
+    if name == "veeeq":
+        return "≚"
+    if name == "vellip":
+        return "⋮"
+    if name == "verbar":
+        return "|"
+    if name == "vert":
+        return "|"
+    if name == "vfr":
+        return "𝔳"
+    if name == "vltri":
+        return "⊲"
+    if name == "vnsub":
+        return "⊂⃒"
+    if name == "vnsup":
+        return "⊃⃒"
+    if name == "vopf":
+        return "𝕧"
+    if name == "vprop":
+        return "∝"
+    if name == "vrtri":
+        return "⊳"
+    if name == "vscr":
+        return "𝓋"
+    if name == "vsubnE":
+        return "⫋︀"
+    if name == "vsubne":
+        return "⊊︀"
+    if name == "vsupnE":
+        return "⫌︀"
+    if name == "vsupne":
+        return "⊋︀"
+    if name == "vzigzag":
+        return "⦚"
+    if name == "wcirc":
+        return "ŵ"
+    if name == "wedbar":
+        return "⩟"
+    if name == "wedge":
+        return "∧"
+    if name == "wedgeq":
+        return "≙"
+    if name == "weierp":
+        return "℘"
+    if name == "wfr":
+        return "𝔴"
+    if name == "wopf":
+        return "𝕨"
+    if name == "wp":
+        return "℘"
+    if name == "wr":
+        return "≀"
+    if name == "wreath":
+        return "≀"
+    if name == "wscr":
+        return "𝓌"
+    if name == "xcap":
+        return "⋂"
+    if name == "xcirc":
+        return "◯"
+    if name == "xcup":
+        return "⋃"
+    if name == "xdtri":
+        return "▽"
+    if name == "xfr":
+        return "𝔵"
+    if name == "xhArr":
+        return "⟺"
+    if name == "xharr":
+        return "⟷"
+    if name == "xi":
+        return "ξ"
+    if name == "xlArr":
+        return "⟸"
+    if name == "xlarr":
+        return "⟵"
+    if name == "xmap":
+        return "⟼"
+    if name == "xnis":
+        return "⋻"
+    if name == "xodot":
+        return "⨀"
+    if name == "xopf":
+        return "𝕩"
+    if name == "xoplus":
+        return "⨁"
+    if name == "xotime":
+        return "⨂"
+    if name == "xrArr":
+        return "⟹"
+    if name == "xrarr":
+        return "⟶"
+    if name == "xscr":
+        return "𝓍"
+    if name == "xsqcup":
+        return "⨆"
+    if name == "xuplus":
+        return "⨄"
+    if name == "xutri":
+        return "△"
+    if name == "xvee":
+        return "⋁"
+    if name == "xwedge":
+        return "⋀"
+    if name == "yacute":
+        return "ý"
+    if name == "yacy":
+        return "я"
+    if name == "ycirc":
+        return "ŷ"
+    if name == "ycy":
+        return "ы"
+    if name == "yen":
+        return "¥"
+    if name == "yfr":
+        return "𝔶"
+    if name == "yicy":
+        return "ї"
+    if name == "yopf":
+        return "𝕪"
+    if name == "yscr":
+        return "𝓎"
+    if name == "yucy":
+        return "ю"
+    if name == "yuml":
+        return "ÿ"
+    if name == "zacute":
+        return "ź"
+    if name == "zcaron":
+        return "ž"
+    if name == "zcy":
+        return "з"
+    if name == "zdot":
+        return "ż"
+    if name == "zeetrf":
+        return "ℨ"
+    if name == "zeta":
+        return "ζ"
+    if name == "zfr":
+        return "𝔷"
+    if name == "zhcy":
+        return "ж"
+    if name == "zigrarr":
+        return "⇝"
+    if name == "zopf":
+        return "𝕫"
+    if name == "zscr":
+        return "𝓏"
+    if name == "zwj":
+        return "‍"
+    if name == "zwnj":
+        return "‌"
+    return ""
+def _c1_map(cp: Int) -> Int:
+    """The HTML Windows-1252 replacements for C1 numeric references
+    (0x80-0x9F); unlisted entries keep their own value."""
+    if cp == 0x80:
+        return 0x20AC
+    if cp == 0x82:
+        return 0x201A
+    if cp == 0x83:
+        return 0x0192
+    if cp == 0x84:
+        return 0x201E
+    if cp == 0x85:
+        return 0x2026
+    if cp == 0x86:
+        return 0x2020
+    if cp == 0x87:
+        return 0x2021
+    if cp == 0x88:
+        return 0x02C6
+    if cp == 0x89:
+        return 0x2030
+    if cp == 0x8A:
+        return 0x0160
+    if cp == 0x8B:
+        return 0x2039
+    if cp == 0x8C:
+        return 0x0152
+    if cp == 0x8E:
+        return 0x017D
+    if cp == 0x91:
+        return 0x2018
+    if cp == 0x92:
+        return 0x2019
+    if cp == 0x93:
+        return 0x201C
+    if cp == 0x94:
+        return 0x201D
+    if cp == 0x95:
+        return 0x2022
+    if cp == 0x96:
+        return 0x2013
+    if cp == 0x97:
+        return 0x2014
+    if cp == 0x98:
+        return 0x02DC
+    if cp == 0x99:
+        return 0x2122
+    if cp == 0x9A:
+        return 0x0161
+    if cp == 0x9B:
+        return 0x203A
+    if cp == 0x9C:
+        return 0x0153
+    if cp == 0x9E:
+        return 0x017E
+    if cp == 0x9F:
+        return 0x0178
+    return cp
 
 
 def _decode_codepoint(cp: Int) -> String:
     if cp == 0 or cp > 0x10FFFF or (0xD800 <= cp and cp <= 0xDFFF):
         return "�"
+    var v = cp
+    if 0x80 <= cp and cp <= 0x9F:
+        # HTML numeric references in the C1 range map through the
+        # Windows-1252 replacements.
+        v = _c1_map(cp)
     var buf = List[UInt8]()
-    if cp < 0x80:
-        buf.append(UInt8(cp))
-    elif cp < 0x800:
-        buf.append(UInt8(0xC0 | (cp >> 6)))
-        buf.append(UInt8(0x80 | (cp & 0x3F)))
-    elif cp < 0x10000:
-        buf.append(UInt8(0xE0 | (cp >> 12)))
-        buf.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
-        buf.append(UInt8(0x80 | (cp & 0x3F)))
+    if v < 0x80:
+        buf.append(UInt8(v))
+    elif v < 0x800:
+        buf.append(UInt8(0xC0 | (v >> 6)))
+        buf.append(UInt8(0x80 | (v & 0x3F)))
+    elif v < 0x10000:
+        buf.append(UInt8(0xE0 | (v >> 12)))
+        buf.append(UInt8(0x80 | ((v >> 6) & 0x3F)))
+        buf.append(UInt8(0x80 | (v & 0x3F)))
     else:
-        buf.append(UInt8(0xF0 | (cp >> 18)))
-        buf.append(UInt8(0x80 | ((cp >> 12) & 0x3F)))
-        buf.append(UInt8(0x80 | ((cp >> 6) & 0x3F)))
-        buf.append(UInt8(0x80 | (cp & 0x3F)))
+        buf.append(UInt8(0xF0 | (v >> 18)))
+        buf.append(UInt8(0x80 | ((v >> 12) & 0x3F)))
+        buf.append(UInt8(0x80 | ((v >> 6) & 0x3F)))
+        buf.append(UInt8(0x80 | (v & 0x3F)))
     return String(StringSlice(unsafe_from_utf8=Span(buf)))
 
 
@@ -2818,20 +7148,29 @@ def render_inline(s: String, mut ctx: Ctx) -> String:
             text += "~"
             i += 1
             continue
-        # Hard break: two or more spaces before a line ending.
-        if b == 0x20:
+        # Whitespace run: before a line ending it is consumed by the
+        # break — two or more spaces make a hard break; anything
+        # less, tabs included, leaves a soft break (the line ending
+        # itself flows on as text). Elsewhere the run is literal.
+        if b == 0x20 or b == 0x09:
             var j = i
-            while j < n and bytes[j] == 0x20:
+            var spaces = 0
+            while j < n and (bytes[j] == 0x20 or bytes[j] == 0x09):
+                if bytes[j] == 0x20:
+                    spaces += 1
                 j += 1
-            if j < n and bytes[j] == 0x0A and j - i >= 2:
-                _flush_inline(text, nodes)
-                nodes.append(InNode(String("<br />\n")))
-                i = j + 1
-                continue
-            if j + 1 < n and bytes[j] == 0x0D and bytes[j + 1] == 0x0A and j - i >= 2:
-                _flush_inline(text, nodes)
-                nodes.append(InNode(String("<br />\n")))
-                i = j + 2
+            var eol = 0
+            if j < n and bytes[j] == 0x0A:
+                eol = 1
+            elif j + 1 < n and bytes[j] == 0x0D and bytes[j + 1] == 0x0A:
+                eol = 2
+            if eol > 0:
+                if spaces >= 2:
+                    _flush_inline(text, nodes)
+                    nodes.append(InNode(String("<br />\n")))
+                    i = j + eol
+                else:
+                    i = j
                 continue
             text += _sub(s, i, j)
             i = j

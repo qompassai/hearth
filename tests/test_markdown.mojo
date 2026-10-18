@@ -42,7 +42,7 @@ def main() raises:
     s.eq(render_html("a **b** c\n"), "<p>a <strong>b</strong> c</p>\n", "strong")
     s.eq(render_html("`x < y`\n"), "<p><code>x &lt; y</code></p>\n", "code span escapes")
     s.eq(render_html("[t](/u \"T\")\n"), '<p><a href="/u" title="T">t</a></p>\n', "inline link with title")
-    s.eq(render_html("- a\n- b\n"), "<ul>\n<li>a\n</li>\n<li>b\n</li>\n</ul>\n", "tight list")
+    s.eq(render_html("- a\n- b\n"), "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n", "tight list")
     s.eq(
         render_html("| A | B |\n|---|---|\n| 1 | 2 |\n"),
         "<table>\n<thead>\n<tr>\n<th>A</th>\n<th>B</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>\n",
