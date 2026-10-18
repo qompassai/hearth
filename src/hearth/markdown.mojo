@@ -987,6 +987,12 @@ struct Ctx(Copyable, Movable):
     var used_ids: List[String]
     var with_ids: Bool
     var site: Bool
+    # Per-line flags for the frame currently being rendered: lines
+    # gathered lazily (paragraph continuation across a container
+    # boundary). A lazy line undergoes no block-start processing --
+    # in particular it cannot be a setext underline or interrupt the
+    # paragraph it continues.
+    var lazy: List[Bool]
 
     def __init__(out self, refs: RefStore, site: Bool = False):
         self.refs = refs.copy()
@@ -994,6 +1000,7 @@ struct Ctx(Copyable, Movable):
         self.used_ids = List[String]()
         self.with_ids = site
         self.site = site
+        self.lazy = List[Bool]()
 
     def unique_id(mut self, text: String) -> String:
         var base = slugify(text)
@@ -1372,6 +1379,25 @@ def _html_end_line(line: String, block_type: Int) -> Bool:
     if block_type == 5:
         return line.find("]]>") != -1
     return False
+def _starts_new_block(line: String) -> Bool:
+    """Whether a line starts a block at a boundary, where no
+    paragraph is open -- the test container gathers apply before
+    treating a line as lazy paragraph text. Unlike the paragraph
+    interruption test, an ordered marker of any number and an empty
+    marker both count: the paragraph they would join lives inside
+    the container, not here."""
+    if _is_blank(line):
+        return False
+    if _fence_start(line)[0] or _atx_heading(line)[0]:
+        return True
+    if _is_thematic_break(line) or _html_block_type(line) > 0:
+        return True
+    if _list_marker(line).ok:
+        return True
+    var p = _first_nonspace(line)
+    return p < line.byte_length() and line.as_bytes()[p] == 0x3E
+
+
 def _block_starts(line: String, consumed: Bool) -> Bool:
     if consumed or _is_blank(line):
         return True
@@ -1383,8 +1409,9 @@ def _block_starts(line: String, consumed: Bool) -> Bool:
     if 1 <= ht and ht <= 6:
         return True
     var bm = _list_marker(line)
-    if bm.ok and not bm.blank:
-        # An empty item cannot interrupt a paragraph.
+    if bm.ok and not bm.blank and not (bm.ordered and bm.number != 1):
+        # An empty item cannot interrupt a paragraph, and neither can
+        # an ordered list that does not start at 1.
         return True
     var i = _first_nonspace(line)
     return i < line.byte_length() and line.as_bytes()[i] == 0x3E
@@ -1508,6 +1535,37 @@ def _render_table(
     return (out^, j)
 
 
+def _open_paragraph_after(line: String) -> Bool:
+    """Whether the innermost leaf opened by a content line is a
+    paragraph: strip leading containers (blockquote markers, a list
+    marker) and judge what remains."""
+    var cur = line
+    for _ in range(8):
+        if _is_blank(cur):
+            return False
+        var p = _first_nonspace(cur)
+        if (
+            _leading_spaces(cur) < 4
+            and p < cur.byte_length()
+            and cur.as_bytes()[p] == 0x3E
+        ):
+            var after = p + 1
+            if after < cur.byte_length() and (
+                cur.as_bytes()[after] == 0x20 or cur.as_bytes()[after] == 0x09
+            ):
+                var acol = _column_at(cur, after)
+                cur = _content_after(cur, after, acol, acol + 1)
+            else:
+                cur = _sub(cur, after, cur.byte_length())
+            continue
+        var m = _list_marker(cur)
+        if m.ok:
+            cur = _item_content(cur, m)
+            continue
+        return _leaf_is_paragraph(cur)
+    return False
+
+
 def _leaf_is_paragraph(line: String) -> Bool:
     """Whether `line`, as a frame's newest line, leaves a paragraph
     as the open leaf block — so a following line may continue it
@@ -1526,6 +1584,40 @@ def _leaf_is_paragraph(line: String) -> Bool:
     return True
 
 
+def _fence_track(
+    content: String, in_fence: Bool, fence_char: UInt8, fence_len: Int
+) -> Tuple[Bool, UInt8, Int]:
+    """Advance fence state over one item-content line: an opening
+    fence starts tracking; a run of the fence character at least as
+    long, followed only by blanks, closes it."""
+    if in_fence:
+        var p = _first_nonspace(content)
+        var bytes = content.as_bytes()
+        var run = 0
+        var q = p
+        while q < len(bytes) and bytes[q] == fence_char:
+            run += 1
+            q += 1
+        if (
+            _leading_spaces(content) < 4
+            and run >= fence_len
+            and String(_sub(content, q, len(bytes)).strip()) == ""
+        ):
+            return (False, fence_char, fence_len)
+        return (True, fence_char, fence_len)
+    var fs = _fence_start(content)
+    if fs[0]:
+        return (True, fs[1], fs[2])
+    return (False, fence_char, fence_len)
+
+
+def _item_has_content(item: List[String]) -> Bool:
+    for ref l in item:
+        if not _is_blank(l):
+            return True
+    return False
+
+
 def _render_list(
     lines: List[String],
     start: Int,
@@ -1536,15 +1628,52 @@ def _render_list(
 ) -> Tuple[String, Int]:
     var first = _list_marker(lines[start])
     var items = List[List[String]]()
+    var item_lazy = List[List[Bool]]()
     var loose = False
     var j = start
     var content_col = first.content_col
+    var para_open = False
+    var in_fence = False
+    var fence_char: UInt8 = 0
+    var fence_len = 0
     while j < hi:
-        if consumed[j]:
-            break
         var line = lines[j]
-        # A thematic break at the list's own level ends the list
-        # (it takes precedence over reading the line as an item).
+        if consumed[j]:
+            # A definition line: inside the current item it is item
+            # content (invisible there too); at the list's own level
+            # it is simply passed over -- definitions never break a
+            # list.
+            if len(items) > 0 and _leading_spaces(line) >= content_col:
+                items[len(items) - 1].append(_strip_columns(line, content_col))
+                item_lazy[len(item_lazy) - 1].append(False)
+                j += 1
+                continue
+            if len(items) > 0:
+                j += 1
+                continue
+            break
+        # Fence interior: lines belong to the open fence (they never
+        # loosen the list); a non-blank line dedented below the item's
+        # content column closes the item, and the fence with it.
+        if in_fence:
+            if _is_blank(line):
+                items[len(items) - 1].append(_strip_columns(line, content_col))
+                item_lazy[len(item_lazy) - 1].append(False)
+                j += 1
+                continue
+            if _leading_spaces(line) < content_col:
+                break
+            var fcontent = _strip_columns(line, content_col)
+            var fst = _fence_track(fcontent, True, fence_char, fence_len)
+            in_fence = fst[0]
+            fence_char = fst[1]
+            fence_len = fst[2]
+            items[len(items) - 1].append(fcontent^)
+            item_lazy[len(item_lazy) - 1].append(False)
+            para_open = False
+            j += 1
+            continue
+        # A thematic break at the list's own level ends the list.
         if (
             j > start
             and _is_thematic_break(line)
@@ -1554,42 +1683,87 @@ def _render_list(
         var m = _list_marker(line)
         var same_list = (
             m.ok
-            and m.indent == first.indent
             and m.ordered == first.ordered
-            and (first.ordered and m.bullet == first.bullet or not first.ordered and m.bullet == first.bullet)
+            and m.bullet == first.bullet
+            and (j == start or m.indent < content_col)
         )
-        if same_list and len(items) > 0 or (same_list and j == start):
+        if same_list and (len(items) > 0 or j == start):
             content_col = m.content_col
             var content = _item_content(line, m)
             var item = List[String]()
-            item.append(content^)
+            item.append(content)
             items.append(item^)
+            var flags = List[Bool]()
+            flags.append(False)
+            item_lazy.append(flags^)
+            para_open = _open_paragraph_after(content)
+            var ost = _fence_track(content, False, fence_char, fence_len)
+            in_fence = ost[0]
+            fence_char = ost[1]
+            fence_len = ost[2]
             j += 1
             continue
         if _is_blank(line):
-            # Look ahead: the list continues if the next non-blank line is
-            # a new item or an indented continuation.
+            # Look ahead: the list continues if the next non-blank
+            # line is a new item or an indented continuation of an
+            # item that has content (an empty item ends here).
             var k = j + 1
-            while k < hi and _is_blank(lines[k]) and not consumed[k]:
+            while k < hi and (_is_blank(lines[k]) or consumed[k]):
                 k += 1
-            if k < hi and not consumed[k]:
+            if k < hi and not consumed[k] and len(items) > 0:
                 var m2 = _list_marker(lines[k])
-                var continues = (m2.ok and m2.indent == first.indent) or (
-                    _leading_spaces(lines[k]) >= content_col
+                var is_next = (
+                    m2.ok
+                    and m2.ordered == first.ordered
+                    and m2.bullet == first.bullet
+                    and m2.indent < content_col
                 )
-                if continues:
-                    loose = True
-                    if len(items) > 0:
+                var is_cont = _leading_spaces(lines[k]) >= content_col and _item_has_content(
+                    items[len(items) - 1]
+                )
+                if is_next or is_cont:
+                    # A blank-separated continuation loosens this
+                    # list -- unless the continuation dives into a
+                    # nested item the current item opened, in which
+                    # case the blank belongs to the nested list.
+                    if is_next:
+                        loose = True
+                    elif is_cont:
+                        var cur_item = items[len(items) - 1].copy()
+                        var li = len(cur_item) - 1
+                        while li >= 0 and _is_blank(cur_item[li]):
+                            li -= 1
+                        var nested = False
+                        if li >= 0:
+                            var ml = _list_marker(cur_item[li])
+                            if ml.ok and (
+                                _leading_spaces(lines[k]) - content_col
+                                >= ml.content_col
+                            ):
+                                nested = True
+                        if not nested:
+                            loose = True
+                    for _ in range(k - j):
                         items[len(items) - 1].append(String())
+                        item_lazy[len(item_lazy) - 1].append(False)
                     j = k
                     continue
             break
         if len(items) > 0 and _leading_spaces(line) >= content_col:
-            items[len(items) - 1].append(_strip_columns(line, content_col))
+            var content2 = _strip_columns(line, content_col)
+            para_open = _open_paragraph_after(content2)
+            var cst = _fence_track(content2, in_fence, fence_char, fence_len)
+            in_fence = cst[0]
+            fence_char = cst[1]
+            fence_len = cst[2]
+            items[len(items) - 1].append(content2^)
+            item_lazy[len(item_lazy) - 1].append(False)
             j += 1
             continue
-        if len(items) > 0 and not _block_starts(line, False):
+        if len(items) > 0 and para_open and not _starts_new_block(line):
+            # Lazy continuation of the item's open paragraph.
             items[len(items) - 1].append(String(line.strip()))
+            item_lazy[len(item_lazy) - 1].append(True)
             j += 1
             continue
         break
@@ -1602,22 +1776,30 @@ def _render_list(
     else:
         out += "<ul>\n"
     var no_consume = List[Bool]()
-    for item in items:
+    for idx in range(len(items)):
+        var item = items[idx].copy()
         for _ in range(len(item)):
             no_consume.append(False)
-        var inner = render_blocks(item, 0, len(item), no_consume, ctx, depth + 1)
-        no_consume.clear()
-        var single_para = (
-            inner.startswith("<p>")
-            and inner.endswith("</p>\n")
-            and inner.find("<p>", 3) == -1
+        var saved_lazy = ctx.lazy.copy()
+        ctx.lazy = item_lazy[idx].copy()
+        var rr = render_blocks(
+            item, 0, len(item), no_consume, ctx, depth + 1, not loose
         )
+        ctx.lazy = saved_lazy.copy()
+        no_consume.clear()
+        var inner = rr[0]
         if inner == "":
             out += "<li></li>\n"
-        elif not loose and single_para:
-            # Tight single-paragraph item: bare inline content, no
-            # trailing newline inside the item.
-            out += "<li>" + _sub(inner, 3, inner.byte_length() - 5) + "</li>\n"
+        elif not loose:
+            var body = inner
+            if rr[2]:
+                # The last block is a bare paragraph: its trailing
+                # newline is the block separator, not content.
+                body = _sub(body, 0, body.byte_length() - 1)
+            if rr[1]:
+                out += "<li>" + body + "</li>\n"
+            else:
+                out += "<li>\n" + body + "</li>\n"
         else:
             out += "<li>\n" + inner + "</li>\n"
     out += "</ol>\n" if first.ordered else "</ul>\n"
@@ -1655,10 +1837,18 @@ def render_blocks(
     consumed: List[Bool],
     mut ctx: Ctx,
     depth: Int,
-) -> String:
+    bare_paras: Bool,
+) -> Tuple[String, Bool, Bool]:
+    """Render a frame of lines. Returns the HTML and whether the
+    frame's first / last top-level blocks are paragraphs (the list
+    renderer needs both to shape tight items). With `bare_paras`,
+    paragraphs render as bare inline content (tight list items)."""
     var out = String()
+    var blocks_seen = 0
+    var first_para = False
+    var last_para = False
     if depth > MAX_BLOCK_DEPTH:
-        return out^
+        return (out^, False, False)
     var i = lo
     while i < hi:
         if consumed[i] or _is_blank(lines[i]):
@@ -1713,6 +1903,10 @@ def render_blocks(
                     out += ' class="language-' + escape_attr(first_word) + '"'
             out += ">" + escape_text(content) + "</code></pre>\n"
             i = j + 1 if j < hi else hi
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # ATX heading.
         var atx = _atx_heading(line)
@@ -1726,11 +1920,19 @@ def render_blocks(
             out += ">" + inner
             out += "</h" + String(atx[1]) + ">\n"
             i += 1
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # Thematic break (before list/paragraph: `- - -` reads as break).
         if _is_thematic_break(line):
             out += "<hr />\n"
             i += 1
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # Blockquote.
         var qpos = _first_nonspace(line)
@@ -1766,12 +1968,12 @@ def render_blocks(
                         stripped = _content_after(ql, after, acol, acol + 1)
                     else:
                         stripped = _sub(ql, after, ql.byte_length())
-                    para_open = _leaf_is_paragraph(_bq_strip(stripped)[1])
+                    para_open = _open_paragraph_after(stripped)
                     inner_lines.append(stripped^)
                     inner_direct.append(True)
                     j += 1
                     continue
-                if _block_starts(ql, False):
+                if _starts_new_block(ql):
                     break
                 if not para_open:
                     # Lazy continuation exists only for an open
@@ -1780,29 +1982,24 @@ def render_blocks(
                 inner_lines.append(ql.copy())  # lazy continuation
                 inner_direct.append(False)
                 j += 1
-            # A lazy setext underline cannot convert a paragraph whose
-            # last line sits inside the quote: hand the underline back
-            # to this frame.
-            while len(inner_lines) >= 2:
-                var last = len(inner_lines) - 1
-                if (
-                    not inner_direct[last]
-                    and inner_direct[last - 1]
-                    and _setext_level(inner_lines[last]) > 0
-                ):
-                    _ = inner_lines.pop()
-                    _ = inner_direct.pop()
-                    j -= 1
-                else:
-                    break
             var no_consume = List[Bool]()
             for _ in range(len(inner_lines)):
                 no_consume.append(False)
+            var saved_lazy = ctx.lazy.copy()
+            var inner_flags = List[Bool]()
+            for ref d in inner_direct:
+                inner_flags.append(not d)
+            ctx.lazy = inner_flags^
             var inner = render_blocks(
-                inner_lines, 0, len(inner_lines), no_consume, ctx, depth + 1
-            )
+                inner_lines, 0, len(inner_lines), no_consume, ctx, depth + 1, False
+            )[0]
+            ctx.lazy = saved_lazy.copy()
             out += "<blockquote>\n" + inner + "</blockquote>\n"
             i = j
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # HTML block: types 1-5 run to their end-condition line
         # (blank lines included); types 6-7 end at a blank line.
@@ -1823,6 +2020,10 @@ def render_blocks(
                     j += 1
             out += raw
             i = j
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # Indented code (only at a block boundary, which here is given:
         # paragraph continuation is claimed by the paragraph branch).
@@ -1846,6 +2047,10 @@ def render_blocks(
                 j += 1
             out += "<pre><code>" + escape_text(content) + "</code></pre>\n"
             i = j
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # Table: header line + delimiter line.
         if i + 1 < hi and not consumed[i + 1] and line.find("|") != -1:
@@ -1854,6 +2059,10 @@ def render_blocks(
                 var t = _render_table(lines, i, hi, ctx)
                 out += t[0]
                 i = t[1]
+                last_para = False
+                if blocks_seen == 0:
+                    first_para = False
+                blocks_seen += 1
                 continue
         # List.
         var m = _list_marker(line)
@@ -1861,6 +2070,10 @@ def render_blocks(
             var l = _render_list(lines, i, hi, consumed, ctx, depth)
             out += l[0]
             i = l[1]
+            last_para = False
+            if blocks_seen == 0:
+                first_para = False
+            blocks_seen += 1
             continue
         # Paragraph (with setext-heading detection).
         var j = i
@@ -1868,13 +2081,15 @@ def render_blocks(
         var setext = 0
         while j < hi and not consumed[j] and not _is_blank(lines[j]):
             if j > i:
-                var lvl = _setext_level(lines[j])
-                if lvl > 0:
-                    setext = lvl
-                    j += 1
-                    break
-                if _block_starts(lines[j], False):
-                    break
+                var lazy_j = (j - lo) < len(ctx.lazy) and ctx.lazy[j - lo]
+                if not lazy_j:
+                    var lvl = _setext_level(lines[j])
+                    if lvl > 0:
+                        setext = lvl
+                        j += 1
+                        break
+                    if _block_starts(lines[j], False):
+                        break
             if j > i:
                 text += "\n"
             text += _lstrip_blanks(lines[j])
@@ -1895,10 +2110,16 @@ def render_blocks(
                 out += ' id="' + id + '"'
             out += ">" + inner
             out += "</h" + String(setext) + ">\n"
+        elif bare_paras:
+            out += render_inline(text, ctx) + "\n"
         else:
             out += "<p>" + render_inline(text, ctx) + "</p>\n"
+        last_para = setext == 0
+        if blocks_seen == 0:
+            first_para = setext == 0
+        blocks_seen += 1
         i = j
-    return out^
+    return (out^, first_para, last_para)
 
 
 def render_markdown(source: String, site_extensions: Bool = False) raises -> MdResult:
@@ -1908,7 +2129,7 @@ def render_markdown(source: String, site_extensions: Bool = False) raises -> MdR
     var lines = _split_lines(clean)
     var collected = _collect_refs(lines)
     var ctx = Ctx(collected[0], site_extensions)
-    var html = render_blocks(lines, 0, len(lines), collected[1], ctx, 0)
+    var html = render_blocks(lines, 0, len(lines), collected[1], ctx, 0, False)[0]
     if len(ctx.refs.fn_used) > 0:
         html += '<section class="footnotes" data-footnotes>\n<ol>\n'
         for idx in range(len(ctx.refs.fn_used)):
