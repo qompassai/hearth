@@ -136,14 +136,31 @@ def escape_attr(s: String) -> String:
 
 
 def encode_uri(s: String) -> String:
-    """Percent-encode bytes a URI may not carry literally (controls, space,
-    and non-ASCII), leaving the reserved/unreserved sets untouched."""
+    """Percent-encode the bytes a URI may not carry literally:
+    controls, space, non-ASCII, and the printable characters the
+    reference href escaper rejects (\" < > \\ [ ] ^ ` { | })."""
     var bytes = s.as_bytes()
     var out = String()
     comptime HEX = "0123456789ABCDEF"
     for i in range(len(bytes)):
         var b = bytes[i]
-        if b >= UInt8(0x80) or b <= UInt8(0x20) or b == 0x7F:
+        var unsafe = (
+            b >= UInt8(0x80)
+            or b <= UInt8(0x20)
+            or b == 0x7F
+            or b == 0x22
+            or b == 0x3C
+            or b == 0x3E
+            or b == 0x5B
+            or b == 0x5C
+            or b == 0x5D
+            or b == 0x5E
+            or b == 0x60
+            or b == 0x7B
+            or b == 0x7C
+            or b == 0x7D
+        )
+        if unsafe:
             out += "%"
             out += String(StringSlice(unsafe_from_utf8=HEX.as_bytes()[Int(b >> 4) : Int(b >> 4) + 1]))
             out += String(StringSlice(unsafe_from_utf8=HEX.as_bytes()[Int(b & 0xF) : Int(b & 0xF) + 1]))
@@ -152,24 +169,120 @@ def encode_uri(s: String) -> String:
     return out^
 
 
+def _fold_cp(cp: Int, s: String, pos: Int, length: Int) -> String:
+    """The lowercase mapping of one codepoint, for label matching:
+    ASCII, Latin-1, Greek, Cyrillic, Armenian, and fullwidth ranges,
+    plus the dotted-capital-I special case."""
+    if 0x41 <= cp and cp <= 0x5A:
+        return _sub("abcdefghijklmnopqrstuvwxyz", cp - 0x41, cp - 0x41 + 1)
+    if 0xC0 <= cp and cp <= 0xDE and cp != 0xD7:
+        return _decode_codepoint(cp + 0x20)
+    if cp == 0x130:  # İ folds to i + combining dot above (U+0307)
+        return String("i") + _decode_codepoint(0x307)
+    if cp == 0x178:
+        return _decode_codepoint(0xFF)
+    if cp == 0x386:
+        return _decode_codepoint(0x3AC)
+    if cp == 0x388:
+        return _decode_codepoint(0x3AD)
+    if cp == 0x389:
+        return _decode_codepoint(0x3AE)
+    if cp == 0x38A:
+        return _decode_codepoint(0x3AF)
+    if cp == 0x38C:
+        return _decode_codepoint(0x3CC)
+    if cp == 0x38E:
+        return _decode_codepoint(0x3CD)
+    if cp == 0x38F:
+        return _decode_codepoint(0x3CE)
+    if (0x391 <= cp and cp <= 0x3A1) or (0x3A3 <= cp and cp <= 0x3AB):
+        return _decode_codepoint(cp + 0x20)
+    if 0x400 <= cp and cp <= 0x40F:
+        return _decode_codepoint(cp + 0x50)
+    if 0x410 <= cp and cp <= 0x42F:
+        return _decode_codepoint(cp + 0x20)
+    if 0x531 <= cp and cp <= 0x556:
+        return _decode_codepoint(cp + 0x30)
+    if 0xFF21 <= cp and cp <= 0xFF3A:
+        return _decode_codepoint(cp + 0x20)
+    # Full-fold specials (CaseFolding.txt F mappings and symbol forms).
+    if cp == 0xDF or cp == 0x1E9E:
+        return String("ss")
+    if cp == 0x17F:
+        return String("s")
+    if cp == 0x138:
+        return String("k")
+    if cp == 0xB5:
+        return _decode_codepoint(0x3BC)
+    if cp == 0x3C2:
+        return _decode_codepoint(0x3C3)
+    if cp == 0x3D0:
+        return _decode_codepoint(0x3B2)
+    if cp == 0x3D1 or cp == 0x3F4:
+        return _decode_codepoint(0x3B8)
+    if cp == 0x3D5:
+        return _decode_codepoint(0x3C6)
+    if cp == 0x3D6:
+        return _decode_codepoint(0x3C0)
+    if cp == 0x3F0:
+        return _decode_codepoint(0x3BA)
+    if cp == 0x3F1:
+        return _decode_codepoint(0x3C1)
+    if cp == 0x3F5:
+        return _decode_codepoint(0x3B5)
+    if cp == 0xFB00:
+        return String("ff")
+    if cp == 0xFB01:
+        return String("fi")
+    if cp == 0xFB02:
+        return String("fl")
+    if cp == 0xFB03:
+        return String("ffi")
+    if cp == 0xFB04:
+        return String("ffl")
+    if cp == 0xFB05 or cp == 0xFB06:
+        return String("st")
+    if (cp == 0x1C4 or cp == 0x1C5):
+        return _decode_codepoint(0x1C6)
+    if (cp == 0x1C7 or cp == 0x1C8):
+        return _decode_codepoint(0x1C9)
+    if (cp == 0x1CA or cp == 0x1CB):
+        return _decode_codepoint(0x1CC)
+    if (cp == 0x1F1 or cp == 0x1F2):
+        return _decode_codepoint(0x1F3)
+    if 0x100 <= cp and cp <= 0x12E and cp % 2 == 0 and cp != 0x130:
+        return _decode_codepoint(cp + 1)
+    if 0x139 <= cp and cp <= 0x148 and cp % 2 == 1:
+        return _decode_codepoint(cp + 1)
+    return _sub(s, pos, pos + length)
+
+
 def normalize_label(s: String) -> String:
+    """Label matching form: internal Unicode-whitespace runs
+    collapse to one space, ends are trimmed, case is folded."""
     var bytes = s.as_bytes()
     var out = String()
     var pending_space = False
-    for i in range(len(bytes)):
-        var b = bytes[i]
-        if _is_space(b):
+    var i = 0
+    while i < len(bytes):
+        var dec = _decode_cp(s, i)
+        var cp = dec[0]
+        if (
+            cp == 0x20
+            or cp == 0x09
+            or cp == 0x0A
+            or cp == 0x0D
+            or cp == 0x0B
+            or cp == 0x0C
+        ):
             pending_space = True
+            i += dec[1]
             continue
         if pending_space and out.byte_length() > 0:
             out += " "
         pending_space = False
-        var lb = _lower_ascii(b)
-        out += String(
-            StringSlice(unsafe_from_utf8=bytes[i : i + 1])
-        ) if lb == b else _sub(
-            "abcdefghijklmnopqrstuvwxyz", Int(lb) - 0x61, Int(lb) - 0x61 + 1
-        )
+        out += _fold_cp(dec[0], s, i, dec[1])
+        i += dec[1]
     return out^
 
 
@@ -496,6 +609,73 @@ def _skip_link_ws(s: String, i: Int) -> Tuple[Int, Bool]:
     return (j, True)
 
 
+def _parse_dest(s: String, i: Int) -> Tuple[Bool, String, Int]:
+    """Parse a link destination at `i`: a pointy <...> form (escape
+    pairs consumed atomically; unescaped < or a line ending fails) or
+    a bare form (non-space, non-control characters with balanced
+    unescaped parentheses). Returns (ok, dest, index past it)."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    if i < n and bytes[i] == 0x3C:
+        var j = i + 1
+        while j < n:
+            var b = bytes[j]
+            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
+                j += 2
+                continue
+            if b == 0x3E:
+                return (True, _sub(s, i + 1, j), j + 1)
+            if b == 0x3C or b == 0x0A or b == 0x0D:
+                return (False, String(), i)
+            j += 1
+        return (False, String(), i)
+    var depth = 0
+    var j = i
+    while j < n:
+        var b = bytes[j]
+        if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
+            j += 2
+            continue
+        if b <= UInt8(0x20):
+            break
+        if b == 0x28:
+            depth += 1
+        elif b == 0x29:
+            if depth == 0:
+                break
+            depth -= 1
+        j += 1
+    if depth != 0:
+        return (False, String(), i)
+    return (True, _sub(s, i, j), j)
+
+
+def _parse_link_title(s: String, i: Int) -> Tuple[Bool, String, Int]:
+    """Parse a link title at `i` ("...", '...', or (...); a paren
+    title may not contain an unescaped '('). May span lines.
+    Returns (ok, title, index past the closer)."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    if i >= n:
+        return (False, String(), i)
+    var q = bytes[i]
+    if q != 0x22 and q != 0x27 and q != 0x28:
+        return (False, String(), i)
+    var close: UInt8 = 0x29 if q == 0x28 else q
+    var j = i + 1
+    while j < n:
+        var b = bytes[j]
+        if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
+            j += 2
+            continue
+        if q == 0x28 and b == 0x28:
+            return (False, String(), i)
+        if b == close:
+            return (True, _sub(s, i + 1, j), j + 1)
+        j += 1
+    return (False, String(), i)
+
+
 def _parse_link_dest_title(
     s: String, start: Int
 ) -> Tuple[Bool, String, String, Int]:
@@ -507,46 +687,11 @@ def _parse_link_dest_title(
     var i = skipped[0]
     if not skipped[1]:
         return (False, String(), String(), start)
-    var dest = String()
-    if i < n and bytes[i] == 0x3C:  # <...>
-        var j = i + 1
-        var closed = False
-        while j < n:
-            var b = bytes[j]
-            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
-                j += 2
-                continue
-            if b == 0x3E:
-                closed = True
-                break
-            if b == 0x3C or b == 0x0A or b == 0x0D:
-                break
-            j += 1
-        if not closed:
-            return (False, String(), String(), start)
-        dest = _sub(s, i + 1, j)
-        i = j + 1
-    else:
-        var depth = 0
-        var j = i
-        while j < n:
-            var b = bytes[j]
-            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
-                j += 2
-                continue
-            if b <= UInt8(0x20):
-                break
-            if b == 0x28:
-                depth += 1
-            elif b == 0x29:
-                if depth == 0:
-                    break
-                depth -= 1
-            j += 1
-        if depth != 0:
-            return (False, String(), String(), start)
-        dest = _sub(s, i, j)
-        i = j
+    var dest_parsed = _parse_dest(s, i)
+    if not dest_parsed[0]:
+        return (False, String(), String(), start)
+    var dest = dest_parsed[1]
+    i = dest_parsed[2]
     var before_ws = i
     skipped = _skip_link_ws(s, i)
     i = skipped[0]
@@ -557,27 +702,11 @@ def _parse_link_dest_title(
         # A title must be separated from the destination by whitespace.
         if i == before_ws:
             return (False, String(), String(), start)
-        var q = bytes[i]
-        if q != 0x22 and q != 0x27 and q != 0x28:
+        var t = _parse_link_title(s, i)
+        if not t[0]:
             return (False, String(), String(), start)
-        var close: UInt8 = 0x29 if q == 0x28 else q
-        var j = i + 1
-        var closed = False
-        while j < n:
-            var b = bytes[j]
-            if b == 0x5C and j + 1 < n and _is_punct(bytes[j + 1]):
-                j += 2
-                continue
-            if q == 0x28 and b == 0x28:
-                break  # unescaped '(' inside a paren title
-            if b == close:
-                closed = True
-                break
-            j += 1
-        if not closed:
-            return (False, String(), String(), start)
-        title = _sub(s, i + 1, j)
-        i = j + 1
+        title = t[1].copy()
+        i = t[2]
         skipped = _skip_link_ws(s, i)
         i = skipped[0]
         if not skipped[1]:
@@ -587,44 +716,181 @@ def _parse_link_dest_title(
     return (False, String(), String(), start)
 
 
-def _try_ref_def(line: String) -> Tuple[Bool, String, String, String]:
-    """Match a link reference definition occupying a whole line:
-    `[label]: dest "title"`. Returns (ok, label, dest, title)."""
-    var bytes = line.as_bytes()
+def _spnl(s: String, i: Int) -> Int:
+    """Skip spaces and tabs, then at most one line ending and any
+    spaces and tabs after it (the whitespace forms allowed inside a
+    link reference definition)."""
+    var bytes = s.as_bytes()
+    var n = len(bytes)
+    var j = i
+    while j < n and (bytes[j] == 0x20 or bytes[j] == 0x09):
+        j += 1
+    if j < n and bytes[j] == 0x0D and j + 1 < n and bytes[j + 1] == 0x0A:
+        j += 1
+    if j < n and bytes[j] == 0x0A:
+        j += 1
+        while j < n and (bytes[j] == 0x20 or bytes[j] == 0x09):
+            j += 1
+    return j
+
+
+def _parse_ref_def_text(s: String) -> Tuple[Bool, String, String, String, Int]:
+    """Parse one link reference definition at the start of `s` (a
+    paragraph chunk: lines joined by single newlines, no blank
+    lines). The destination may sit on a following line and the
+    title on the line after that; after the destination and the
+    optional title, the rest of the line must be blank, or the whole
+    thing is not a definition.
+    Returns (ok, label, dest, title, chars consumed incl. the final
+    line ending when present)."""
+    var bytes = s.as_bytes()
     var n = len(bytes)
     var i = 0
     while i < n and bytes[i] == 0x20 and i < 4:
         i += 1
     if i >= n or bytes[i] != 0x5B:
-        return (False, String(), String(), String())
-    var j = i + 1
-    while j < n and bytes[j] != 0x5D:
-        if bytes[j] == 0x5C and j + 1 < n:
-            j += 1
-        j += 1
-    if j >= n or j + 1 >= n or bytes[j + 1] != 0x3A:
-        return (False, String(), String(), String())
-    var label = _sub(line, i + 1, j)
-    var rest_start = j + 2
-    while rest_start < n and _is_space(bytes[rest_start]):
-        rest_start += 1
-    var rest = _sub(line, rest_start, n)
-    # Reuse the paren parser by wrapping: "(" + rest + ")".
-    var wrapped = String("(") + rest + ")"
-    var parsed = _parse_link_dest_title(wrapped, 0)
-    if not parsed[0]:
-        return (False, String(), String(), String())
-    if parsed[3] != wrapped.byte_length():
-        return (False, String(), String(), String())
-    return (True, label^, parsed[1].copy(), parsed[2].copy())
+        return (False, String(), String(), String(), 0)
+    var lend = _scan_ref_label(s, i + 1)
+    if lend == -1:
+        return (False, String(), String(), String(), 0)
+    var label = _sub(s, i + 1, lend)
+    if normalize_label(label) == "":
+        return (False, String(), String(), String(), 0)
+    i = lend + 1
+    if i >= n or bytes[i] != 0x3A:
+        return (False, String(), String(), String(), 0)
+    i = _spnl(s, i + 1)
+    if i >= n:
+        return (False, String(), String(), String(), 0)
+    var dp = _parse_dest(s, i)
+    if not dp[0]:
+        return (False, String(), String(), String(), 0)
+    if dp[1] == "" and bytes[i] != 0x3C:
+        return (False, String(), String(), String(), 0)  # no destination
+    var dest = dp[1]
+    i = dp[2]
+    var title = String()
+    var def_end = -1
+    # A title must be separated from the destination by whitespace
+    # (spaces, tabs, or up to one line ending inside the spnl). It is
+    # part of the definition only if nothing but blanks follows it on
+    # its line; otherwise the definition ends at the destination and
+    # the destination's own line must end there.
+    var after_ws = _spnl(s, i)
+    if after_ws > i and after_ws < n and (
+        bytes[after_ws] == 0x22
+        or bytes[after_ws] == 0x27
+        or bytes[after_ws] == 0x28
+    ):
+        var tp = _parse_link_title(s, after_ws)
+        if tp[0]:
+            var k = tp[2]
+            while k < n and (bytes[k] == 0x20 or bytes[k] == 0x09):
+                k += 1
+            if k >= n:
+                title = tp[1].copy()
+                def_end = k
+            elif bytes[k] == 0x0A:
+                title = tp[1].copy()
+                def_end = k + 1
+            elif (
+                bytes[k] == 0x0D
+                and k + 1 < n
+                and bytes[k + 1] == 0x0A
+            ):
+                title = tp[1].copy()
+                def_end = k + 2
+    if def_end == -1:
+        var k = i
+        while k < n and (bytes[k] == 0x20 or bytes[k] == 0x09):
+            k += 1
+        if k >= n:
+            def_end = k
+        elif bytes[k] == 0x0A:
+            def_end = k + 1
+        elif bytes[k] == 0x0D and k + 1 < n and bytes[k + 1] == 0x0A:
+            def_end = k + 2
+    if def_end == -1:
+        return (False, String(), String(), String(), 0)
+    return (True, label^, dest^, title^, def_end)
+
+
+def _bq_strip(line: String) -> Tuple[Int, String]:
+    """Strip blockquote prefixes (up to 3 spaces, '>', one optional
+    space each). Returns (prefix count, remaining text)."""
+    var bytes = line.as_bytes()
+    var pos = 0
+    var count = 0
+    while True:
+        var p = pos
+        var spaces = 0
+        while p < len(bytes) and bytes[p] == 0x20 and spaces < 3:
+            p += 1
+            spaces += 1
+        if p < len(bytes) and bytes[p] == 0x3E:
+            p += 1
+            if p < len(bytes) and bytes[p] == 0x20:
+                p += 1
+            count += 1
+            pos = p
+        else:
+            break
+    return (count, _sub(line, pos, line.byte_length()))
+
+
+def _first_nonspace_byte(line: String) -> Int:
+    var bytes = line.as_bytes()
+    var i = 0
+    while i < len(bytes) and bytes[i] == 0x20:
+        i += 1
+    if i >= len(bytes):
+        return -1
+    return Int(bytes[i])
+
+
+def _lines_spanned(text: String, chars: Int) -> Int:
+    """How many joined-text lines the first `chars` characters span."""
+    var bytes = text.as_bytes()
+    var count = 0
+    var upto = chars if chars < len(bytes) else len(bytes)
+    for k in range(upto):
+        if bytes[k] == 0x0A:
+            count += 1
+    if chars >= len(bytes):
+        return count + 1
+    return count
+
+
+def _def_gate(
+    lines: List[String], consumed: List[Bool], idx: Int, last_def_end: Int
+) -> Bool:
+    """A definition may only start a block: at the document start,
+    after a blank line, after another definition, or after a leaf
+    block line (heading, thematic break, fence) — never inside a
+    paragraph."""
+    if idx == 0:
+        return True
+    if consumed[idx - 1] or last_def_end == idx - 1:
+        return True
+    var prev = lines[idx - 1]
+    if _is_blank(prev) or consumed[idx - 1]:
+        return True
+    if _atx_heading(prev)[0] or _is_thematic_break(prev):
+        return True
+    if _fence_start(prev)[0]:
+        return True
+    return False
 
 
 def _collect_refs(
     lines: List[String],
 ) -> Tuple[RefStore, List[Bool]]:
-    """Pre-pass: record link/footnote definitions and mark their lines
-    consumed. A definition line inside a fenced code block is content,
-    not a definition."""
+    """Pre-pass: record link/footnote definitions and mark their
+    lines consumed. Definitions may span lines (destination or
+    title on a following line) and may live inside blockquotes
+    (registered there for forward references; the block renderer
+    consumes them when it recurses). A definition line inside a
+    fenced code block is content, not a definition."""
     var refs = RefStore()
     var consumed = List[Bool]()
     for _ in range(len(lines)):
@@ -632,7 +898,9 @@ def _collect_refs(
     var in_fence = False
     var fence_char: UInt8 = 0x60
     var fence_len = 0
-    for idx in range(len(lines)):
+    var last_def_end = -1
+    var idx = 0
+    while idx < len(lines):
         var line = lines[idx]
         var bytes = line.as_bytes()
         var indent = _leading_spaces(line)
@@ -652,8 +920,10 @@ def _collect_refs(
                     fence_len = run
                 elif bytes[pos] == fence_char and run >= fence_len:
                     in_fence = False
+                idx += 1
                 continue
         if in_fence or indent >= 4:
+            idx += 1
             continue
         if line.startswith("[^"):
             var close = line.find("]:")
@@ -664,13 +934,45 @@ def _collect_refs(
                     String(_sub(line, close + 2, line.byte_length()).strip())
                 )
                 consumed[idx] = True
+                idx += 1
                 continue
-        var rd = _try_ref_def(line)
-        if rd[0]:
-            if refs.lookup(rd[1]) == -1:
-                refs.labels.append(normalize_label(rd[1]))
-                refs.defs.append(RefDef(rd[2], rd[3]))
-            consumed[idx] = True
+        var stripped = _bq_strip(line)
+        var pc = stripped[0]
+        var first = _first_nonspace_byte(stripped[1]) if pc > 0 else _first_nonspace_byte(line)
+        if first == 0x5B and _def_gate(lines, consumed, idx, last_def_end):
+            var texts = List[String]()
+            texts.append(stripped[1] if pc > 0 else line)
+            var cend = idx + 1
+            while cend < len(lines):
+                var nl = lines[cend]
+                if pc > 0:
+                    var ns = _bq_strip(nl)
+                    if ns[0] != pc or _is_blank(ns[1]):
+                        break
+                    texts.append(ns[1].copy())
+                else:
+                    if _is_blank(nl):
+                        break
+                    texts.append(nl.copy())
+                cend += 1
+            var ctext = String()
+            for k in range(len(texts)):
+                if k > 0:
+                    ctext += "\n"
+                ctext += texts[k]
+            var pd = _parse_ref_def_text(ctext)
+            if pd[0]:
+                if refs.lookup(pd[1]) == -1:
+                    refs.labels.append(normalize_label(pd[1]))
+                    refs.defs.append(RefDef(pd[2], pd[3]))
+                var used = _lines_spanned(ctext, pd[4])
+                last_def_end = idx + used - 1
+                if pc == 0:
+                    for k in range(used):
+                        consumed[idx + k] = True
+                idx += used
+                continue
+        idx += 1
     return (refs^, consumed^)
 
 
@@ -1208,6 +1510,26 @@ def render_blocks(
             i += 1
             continue
         var line = lines[i]
+        # A reference definition at a block boundary registers and
+        # renders nothing. The pre-pass already collected top-level
+        # definitions (first wins); this pass catches the ones inside
+        # containers and keeps container content consistent.
+        if _leading_spaces(line) < 4 and _first_nonspace_byte(line) == 0x5B:
+            var cend = i
+            while cend < hi and not _is_blank(lines[cend]):
+                cend += 1
+            var ctext = String()
+            for k in range(i, cend):
+                if k > i:
+                    ctext += "\n"
+                ctext += lines[k]
+            var pd = _parse_ref_def_text(ctext)
+            if pd[0]:
+                if ctx.refs.lookup(pd[1]) == -1:
+                    ctx.refs.labels.append(normalize_label(pd[1]))
+                    ctx.refs.defs.append(RefDef(pd[2], pd[3]))
+                i += _lines_spanned(ctext, pd[4])
+                continue
         # Fenced code.
         var fence = _fence_start(line)
         if fence[0]:
@@ -2014,6 +2336,26 @@ struct Bracket(Copyable, Movable):
         self.active = True
 
 
+def _scan_ref_label(s: String, start: Int) -> Int:
+    """Scan a reference label starting just after its '[': it ends at
+    the FIRST unescaped ']' and may not contain an unescaped '['
+    (unlike link text, which allows balanced brackets). Returns the
+    index of the ']' or -1."""
+    var bytes = s.as_bytes()
+    var j = start
+    while j < len(bytes) and j - start < 999:
+        var b = bytes[j]
+        if b == 0x5C and j + 1 < len(bytes) and _is_punct(bytes[j + 1]):
+            j += 2
+            continue
+        if b == 0x5D:
+            return j
+        if b == 0x5B:
+            return -1
+        j += 1
+    return -1
+
+
 def _scan_link_label(s: String, start: Int) -> Int:
     """Scan a link label starting just after its '[': returns the
     index of the ']' that closes it (balanced unescaped brackets and
@@ -2124,7 +2466,7 @@ def _close_bracket(
             formed = True
     var label_given = False
     if not formed and after < n and bytes[after] == 0x5B:
-        var lend = _scan_link_label(s, after + 1)
+        var lend = _scan_ref_label(s, after + 1)
         if lend != -1:
             label_given = True
             var lab = _sub(s, after + 1, lend)
